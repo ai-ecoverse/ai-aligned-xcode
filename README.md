@@ -1,5 +1,7 @@
 # ai-aligned-xcode
 
+[![100% Vibe_Coded](https://img.shields.io/badge/100%25-Vibe_Coded-ff69b4?style=for-the-badge&logo=claude&logoColor=white)](https://github.com/ai-ecoverse/vibe-coded-badge-action)
+
 A transparent Xcode toolchain shim for coding agents. It shadows `xcodebuild`,
 `xcrun`, `swift` and `xcodegen` on `PATH` and fixes the things that go wrong
 when several agents share one Mac — **without asking you to teach the agent
