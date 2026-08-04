@@ -179,6 +179,52 @@ out="$(ai-aligned-xcode leases 2>&1)"
 case "$out" in *"$UDID  free"*) ok "lease is released on exit" ;;
                *) no "lease is released on exit" "$out" ;; esac
 
+# --------------------------------------------------------------- derived-data lease
+
+if has_xcode; then
+    # Two builds sharing one DerivedData tree must serialise even with no
+    # simulator involved: 38 such pairs were observed in one worktree.
+    DDL="$(cd "$SCRIPT_DIR" && git rev-parse --show-toplevel 2>/dev/null || echo "$SCRIPT_DIR")"
+    DDPATH="$TMP/shared-dd"
+    mkdir -p "$DDPATH"
+    h=$(printf '%s' "$DDPATH" | tr -d ' ' | cksum | cut -d' ' -f1)
+    DDLOCK="$AI_ALIGNED_XCODE_HOME/leases/dd-$h.lock"
+    mkdir -p "$AI_ALIGNED_XCODE_HOME/leases"
+
+    ( exec 8>>"$DDLOCK"; /usr/bin/lockf -s -t 0 8 && sleep 4; exec 8>&- ) &
+    ddholder=$!
+    sleep 0.5
+    start=$(date +%s)
+    ( cd "$DDL" && xcodebuild -project /nonexistent.xcodeproj -scheme X \
+        -derivedDataPath "$DDPATH" -destination 'generic/platform=iOS Simulator' build \
+      ) >/dev/null 2>"$TMP/dd.err"
+    waited=$(( $(date +%s) - start ))
+    wait "$ddholder" 2>/dev/null
+
+    grep -q 'another build is writing' "$TMP/dd.err" \
+        && ok "serialises builds sharing one DerivedData tree" \
+        || no "serialises builds sharing one DerivedData tree" "$(head -1 "$TMP/dd.err")"
+    [ "$waited" -ge 3 ] && ok "waited for the DerivedData lease (${waited}s)" \
+                        || no "waited for the DerivedData lease" "returned after ${waited}s"
+
+    # A build needing both locks must take DerivedData before the simulator.
+    # Holding only the simulator must not stop it reaching the DD wait, and
+    # vice versa — a cycle would hang past the lease timeout.
+    ( exec 9>>"$AI_ALIGNED_XCODE_HOME/leases/$UDID.lock"; /usr/bin/lockf -s -t 0 9 && sleep 3; exec 9>&- ) &
+    simholder=$!
+    sleep 0.3
+    start=$(date +%s)
+    ( cd "$DDL" && AI_ALIGNED_XCODE_LEASE_WAIT=20 TIMEOUT=20 \
+        xcodebuild -project /nonexistent.xcodeproj -scheme X -derivedDataPath "$DDPATH" \
+        -destination "platform=iOS Simulator,id=$UDID" test ) >/dev/null 2>&1
+    both=$(( $(date +%s) - start ))
+    wait "$simholder" 2>/dev/null
+    [ "$both" -lt 19 ] && ok "acquires both leases without deadlocking (${both}s)" \
+                       || no "acquires both leases without deadlocking" "took ${both}s (lease timeout was 20s)"
+else
+    skip "DerivedData lease" "no Xcode"
+fi
+
 # --------------------------------------------------------------- retry / classes
 #
 # Driven through the `swift` shim with a fake tool on PATH: aax_real_tool skips

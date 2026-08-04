@@ -35,8 +35,12 @@ whole agent turn, so the workaround also burns context and cache.
    for the duration of the run. Contending runs *block inside the shim*, so the
    agent's single tool call absorbs the wait. Returning "busy, try later" is
    what produced the poll loops in the first place.
-2. **Isolates DerivedData.** Injects a per-worktree `-derivedDataPath` when the
-   caller did not set one, so parallel checkouts stop corrupting each other.
+2. **Isolates DerivedData, and leases it too.** Injects a per-worktree
+   `-derivedDataPath` when the caller did not set one, so parallel checkouts
+   stop corrupting each other — and serialises builds that share one tree,
+   because 38 pairs of concurrent builds in a single worktree were observed.
+   `xcodegen` takes the same lease, since regenerating the project invalidates
+   the tree a build is reading.
 3. **Refuses runs nobody budgeted for.** Predicts the runtime from recorded
    history; if the median exceeds the budget (default 300 s) it fails with
    `EX_CONFIG` and a paste-ready command, rather than letting the agent start
@@ -150,6 +154,12 @@ ai-aligned-xcode doctor    # environment check
 Agent detection comes from [am-i-ai](https://github.com/ai-ecoverse/am-i-ai),
 memoised per session — its process-tree walk costs ~54 ms, which is 8× a real
 `xcrun` call and far too much to pay per invocation.
+
+A run can need two leases — the DerivedData tree it writes and the simulator it
+drives — so there is one global ordering rule: **DerivedData (fd 8) before
+simulator (fd 9)**. `xcodegen` takes only fd 8, `xcrun simctl` only fd 9, and
+`xcodebuild` takes 8 then 9, so no cycle can form. A test asserts a run needing
+both completes rather than hanging to the lease timeout.
 
 Locking uses **`/usr/bin/lockf`**, since macOS ships no `flock(1)`. The lock is
 held on a file descriptor by the shim process itself, so `lockf(1)` can exit

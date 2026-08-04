@@ -955,6 +955,60 @@ aax_worktree_slug() {
     printf '%s' "$root" | tr -d ' ' | cksum | cut -d' ' -f1
 }
 
+# ---------------------------------------------------------------- lock ordering
+#
+# A build can need two leases: the DerivedData tree it writes, and the simulator
+# it drives. Two locks admit deadlock, so there is one global rule:
+#
+#     ALWAYS acquire the DerivedData lease (fd 8) before the simulator (fd 9).
+#
+# xcodegen takes only fd 8; `xcrun simctl` takes only fd 9; xcodebuild takes 8
+# then 9. No cycle can form.
+#
+# DerivedData is the right key rather than the project path: two builds sharing
+# a tree corrupt each other whatever project they name, and regenerating the
+# project invalidates that same tree. 38 pairs of concurrent builds in one
+# worktree were observed in the corpus.
+
+aax_dd_lock_file() {
+    local dd="$1" h
+    h=$(printf '%s' "$dd" | tr -d ' ' | cksum | cut -d' ' -f1)
+    printf '%s/dd-%s.lock' "$AAX_LEASES" "$h"
+}
+
+AAX_LEASE_FAILED=0
+AAX_LEASE_WAIT_MS=0
+
+# Acquire a lease on <fd> over <file>, blocking in this process.
+#
+# The lock is held by THIS shell: lockf(1) exits immediately, but the flock(2)
+# lives on the open file description, which our fd keeps alive until we close
+# it. Holding it here (rather than re-exec'ing under `lockf <file> <cmd>`) keeps
+# the watchdog and the timing in the same process, and means the agent's single
+# tool call absorbs the wait. Returning "busy, retry later" instead is what
+# produced the poll loops this tool exists to remove.
+aax_take_lease() {
+    local fd="$1" file="$2" busy_msg="$3" t0
+
+    # Fixed fds rather than eval: only 8 and 9 are ever used, in that order.
+    case "$fd" in
+        8) exec 8>>"$file" ;;
+        9) exec 9>>"$file" ;;
+        *) return 1 ;;
+    esac
+
+    /usr/bin/lockf -s -t 0 "$fd" && return 0
+
+    aax_notice "$busy_msg; waiting (up to ${AAX_LEASE_WAIT}s)"
+    t0=$(date +%s)
+    if ! /usr/bin/lockf -s -t "$AAX_LEASE_WAIT" "$fd"; then
+        aax_notice "gave up waiting after ${AAX_LEASE_WAIT}s"
+        AAX_LEASE_FAILED=1
+    fi
+    AAX_LEASE_WAIT_MS=$(( AAX_LEASE_WAIT_MS + ($(date +%s) - t0) * 1000 ))
+    [ "$AAX_LEASE_FAILED" = "0" ]
+}
+
 # ---------------------------------------------------------------- execution
 
 # Run a command under an optional watchdog. macOS ships no timeout(1), so this
@@ -991,9 +1045,9 @@ aax_run() {
     # otherwise pin the simulator lease for the whole budget after the build
     # already finished.
     if [ -n "$AAX_LOG" ]; then
-        "$@" 9>&- > >(tee -a "$AAX_LOG") 2> >(tee -a "$AAX_LOG" >&2) &
+        "$@" 8>&- 9>&- > >(tee -a "$AAX_LOG") 2> >(tee -a "$AAX_LOG" >&2) &
     else
-        "$@" 9>&- &
+        "$@" 8>&- 9>&- &
     fi
     cmd_pid=$!
     (
@@ -1003,7 +1057,7 @@ aax_run() {
         kill -TERM "$cmd_pid" 2>/dev/null && printf 1 > "$marker"
         sleep 10
         kill -KILL "$cmd_pid" 2>/dev/null
-    ) 9>&- &
+    ) 8>&- 9>&- &
     dog_pid=$!
 
     # Braces + redirect suppress bash's asynchronous "Terminated: 15" job
@@ -1117,7 +1171,7 @@ EOF
 
 aax_shim_xcodebuild() {
     local real agent repo worktree gkey lease_file
-    local start end dur wait_ms=0 rc outcome lease_start
+    local start end dur wait_ms=0 rc outcome
 
     real=$(aax_real_tool xcodebuild) || { echo "ai-aligned-xcode: cannot find real xcodebuild" >&2; exit 127; }
 
@@ -1148,57 +1202,46 @@ aax_shim_xcodebuild() {
     aax_check_budget "$gkey" xcodebuild "$@" || exit 78
 
     local -a argv=("$@")
+    local dd_effective="$AAX_DDP"
 
     # (2) Per-worktree DerivedData. 894 of 1153 observed xcodebuild calls omitted
     # this, so parallel checkouts collided in the default location.
     if [ -z "$AAX_DDP" ] && [ "$AAX_ACTION" != "clean" ]; then
-        local dd
-        dd="$AAX_DD/$(basename "$repo")-$worktree"
-        mkdir -p "$dd" 2>/dev/null
-        argv+=(-derivedDataPath "$dd")
-        aax_notice "using per-worktree DerivedData: $dd"
+        dd_effective="$AAX_DD/$(basename "$repo")-$worktree"
+        mkdir -p "$dd_effective" 2>/dev/null
+        argv+=(-derivedDataPath "$dd_effective")
+        aax_notice "using per-worktree DerivedData: $dd_effective"
     fi
 
-    # (1) Simulator lease. Only when a real device is involved; generic and
-    # macOS destinations run fully parallel.
     local budget=0
     [ -n "$TIMEOUT" ] && budget="$TIMEOUT"
 
     export AI_ALIGNED_XCODE_ACTIVE=1
-    start=$(date +%s000)
+    mkdir -p "$AAX_LEASES" 2>/dev/null
 
-    if [ "$AAX_DEST_KIND" = "sim" ] && [ -n "$AAX_UDID" ] && [ "$AAX_NO_LEASE" = "0" ]; then
-        mkdir -p "$AAX_LEASES" 2>/dev/null
-        lease_file="$AAX_LEASES/$AAX_UDID.lock"
+    # Leases, in the one permitted order: DerivedData (fd 8) then simulator
+    # (fd 9). See "lock ordering". aax_take_lease sets AAX_LEASE_FAILED and
+    # accumulates AAX_LEASE_WAIT_MS.
+    AAX_LEASE_WAIT_MS=0
+    if [ "$AAX_NO_LEASE" = "0" ] && [ "$AAX_ACTION" != "clean" ] && [ -n "$dd_effective" ]; then
+        aax_take_lease 8 "$(aax_dd_lock_file "$dd_effective")" \
+            "another build is writing $dd_effective"
+    fi
+    if [ "$AAX_LEASE_FAILED" = "0" ] && [ "$AAX_NO_LEASE" = "0" ] \
+       && [ "$AAX_DEST_KIND" = "sim" ] && [ -n "$AAX_UDID" ]; then
+        aax_take_lease 9 "$AAX_LEASES/$AAX_UDID.lock" \
+            "simulator $AAX_UDID is leased by another run"
+    fi
+    wait_ms="$AAX_LEASE_WAIT_MS"
 
-        # The lock is held on fd 9 by THIS process: lockf(1) exits immediately,
-        # but the flock(2) lives on the open file description, which our fd
-        # keeps alive until we close it. Holding it here (rather than re-exec'ing
-        # under `lockf <file> <cmd>`) keeps the watchdog and the timing in the
-        # same process, and means the agent's single tool call absorbs the wait.
-        # Returning "busy, retry later" is what produced the poll loops this
-        # tool exists to remove.
-        exec 9>>"$lease_file"
-        if ! /usr/bin/lockf -s -t 0 9; then
-            aax_notice "simulator $AAX_UDID is leased by another run; waiting (up to ${AAX_LEASE_WAIT}s)"
-            lease_start=$(date +%s)
-            if ! /usr/bin/lockf -s -t "$AAX_LEASE_WAIT" 9; then
-                aax_notice "gave up waiting for simulator $AAX_UDID after ${AAX_LEASE_WAIT}s"
-                outcome="lease_timeout"; rc=75
-            fi
-            wait_ms=$(( ($(date +%s) - lease_start) * 1000 ))
-        fi
-
-        if [ -z "$outcome" ]; then
-            start=$(date +%s000)     # time the run, not the wait
-            aax_attempt "$budget" "$real" "${argv[@]}"
-            rc=$?
-        fi
-        exec 9>&-
+    if [ "$AAX_LEASE_FAILED" = "1" ]; then
+        outcome="lease_timeout"; rc=75
     else
+        start=$(date +%s000)     # time the run, not the wait
         aax_attempt "$budget" "$real" "${argv[@]}"
         rc=$?
     fi
+    exec 8>&- 9>&- 2>/dev/null
 
     end=$(date +%s000); dur=$((end - start))
     if [ -z "$outcome" ]; then
@@ -1282,12 +1325,31 @@ aax_shim_recorded() {
     [ -n "$TIMEOUT" ] && budget="$TIMEOUT"
 
     export AI_ALIGNED_XCODE_ACTIVE=1
+
+    # xcodegen rewrites the .xcodeproj a build is reading, so it takes the same
+    # worktree's DerivedData lease (fd 8, and only fd 8 — no cycle possible).
+    # Rare in practice, but an agent was observed polling `pgrep -f xcodegen`
+    # to hand-roll exactly this.
+    AAX_LEASE_FAILED=0
+    if [ "$tool" = "xcodegen" ]; then
+        mkdir -p "$AAX_LEASES" 2>/dev/null
+        aax_take_lease 8 \
+            "$(aax_dd_lock_file "$AAX_DD/$(basename "$repo")-$(aax_worktree_slug "$repo")")" \
+            "a build is using this worktree's DerivedData"
+    fi
+    if [ "$AAX_LEASE_FAILED" = "1" ]; then
+        aax_record "$agent" "$(basename "$repo")" "$(aax_worktree_slug "$repo")" \
+                   "$tool" "$action" "" none "" "$gkey" 0 0 75 lease_timeout
+        exit 75
+    fi
+
     start=$(date +%s000)
     # Classified too: `swift build` can lose to a concurrent build-database lock
     # just as xcodebuild can, and that is worth one retry.
     aax_attempt "$budget" "$real" "$@"
     rc=$?
     dur=$(( $(date +%s000) - start ))
+    exec 8>&- 2>/dev/null
 
     local outcome=ok
     [ "$AAX_TIMED_OUT" = "1" ] && outcome=timeout
