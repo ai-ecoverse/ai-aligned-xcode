@@ -179,6 +179,74 @@ out="$(ai-aligned-xcode leases 2>&1)"
 case "$out" in *"$UDID  free"*) ok "lease is released on exit" ;;
                *) no "lease is released on exit" "$out" ;; esac
 
+# --------------------------------------------------------------- retry / classes
+#
+# Driven through the `swift` shim with a fake tool on PATH: aax_real_tool skips
+# only the shim's own directory, so a stand-in later on PATH is what it resolves.
+# That exercises the real aax_attempt path without needing a project that can
+# reproduce simulator infrastructure failures on demand.
+
+mkdir -p "$TMP/fakebin"
+cat > "$TMP/fakebin/swift" <<'FAKE'
+#!/bin/bash
+c="$AAX_TEST_COUNTER"
+n=$(cat "$c" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$c"
+echo "stdout from attempt $n"
+if [ "$n" -le "${FAIL_TIMES:-1}" ]; then printf '%s\n' "$SIGNATURE" >&2; exit 65; fi
+echo "SUCCESS on attempt $n"; exit 0
+FAKE
+chmod +x "$TMP/fakebin/swift"
+export PATH="$TMP/bin:$TMP/fakebin:$PATH"
+export AAX_TEST_COUNTER="$TMP/attempts"
+
+attempts() { cat "$AAX_TEST_COUNTER" 2>/dev/null || echo 0; }
+reset_attempts() { rm -f "$AAX_TEST_COUNTER"; }
+
+reset_attempts
+SIGNATURE="Timed out while loading Accessibility" FAIL_TIMES=1 swift build >/dev/null 2>"$TMP/r1.err"
+rc=$?
+[ "$rc" -eq 0 ] && [ "$(attempts)" -eq 2 ] \
+    && ok "retries once past a runner-bootstrap failure" \
+    || no "retries once past a runner-bootstrap failure" "rc=$rc attempts=$(attempts)"
+grep -q 'runner_bootstrap: the simulator environment failed' "$TMP/r1.err" \
+    && ok "explains why it retried" \
+    || no "explains why it retried" "$(head -1 "$TMP/r1.err")"
+
+reset_attempts
+SIGNATURE="** TEST FAILED **" FAIL_TIMES=9 swift build >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 65 ] && [ "$(attempts)" -eq 1 ] \
+    && ok "does not retry a genuine test failure" \
+    || no "does not retry a genuine test failure" "rc=$rc attempts=$(attempts)"
+
+reset_attempts
+AI_ALIGNED_XCODE_NO_RETRY=true SIGNATURE="Unable to boot the Simulator" FAIL_TIMES=1 \
+    swift build >/dev/null 2>&1
+[ "$(attempts)" -eq 1 ] && ok "NO_RETRY disables the retry" \
+                        || no "NO_RETRY disables the retry" "attempts=$(attempts)"
+
+# Teeing for classification must not merge the two streams.
+reset_attempts
+SIGNATURE="Unable to boot the Simulator" FAIL_TIMES=1 swift build 2>/dev/null >"$TMP/o.txt"
+reset_attempts
+SIGNATURE="Unable to boot the Simulator" FAIL_TIMES=1 swift build 2>"$TMP/e.txt" >/dev/null
+if grep -q 'SUCCESS on attempt 2' "$TMP/o.txt" && ! grep -q 'Unable to boot' "$TMP/o.txt" \
+   && grep -q 'Unable to boot' "$TMP/e.txt" && ! grep -q 'SUCCESS on attempt' "$TMP/e.txt"; then
+    ok "stdout and stderr stay separated through the tee"
+else
+    no "stdout and stderr stay separated through the tee" \
+       "out=$(tr '\n' '|' <"$TMP/o.txt") err=$(tr '\n' '|' <"$TMP/e.txt")"
+fi
+
+cls="$(sql "SELECT failure_class FROM runs WHERE outcome='ok' AND retried=1 LIMIT 1;")"
+[ "$cls" = "runner_bootstrap" ] || [ "$cls" = "sim_boot" ] \
+    && ok "records which class was recovered ($cls)" \
+    || no "records which class was recovered" "got '$cls'"
+
+out="$(ai-aligned-xcode failures 2>&1)"
+case "$out" in *test_failure*your\ code*) ok "failures separates infrastructure from your code" ;;
+               *) no "failures separates infrastructure from your code" "$out" ;; esac
+
 # --------------------------------------------------------------- summary
 
 echo

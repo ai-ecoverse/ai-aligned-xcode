@@ -770,6 +770,59 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_gkey ON runs(gkey, ts);
 SQL
+    # Additive migrations for databases created by an earlier version. ALTER
+    # fails harmlessly once the column is present.
+    /usr/bin/sqlite3 "$AAX_DB" >/dev/null 2>&1 \
+        "ALTER TABLE runs ADD COLUMN failure_class TEXT;"
+    /usr/bin/sqlite3 "$AAX_DB" >/dev/null 2>&1 \
+        "ALTER TABLE runs ADD COLUMN retried INTEGER DEFAULT 0;"
+}
+
+# ---------------------------------------------------------------- failure classes
+#
+# Separates "the environment broke before your code ran" from "your code is
+# wrong". Only the former is worth retrying: 31.9% of observed `xcodebuild test`
+# invocations failed, and a meaningful share never reached a single assertion.
+#
+# The infrastructure signatures come from slicc's swift-coverage-runner-retry.sh
+# (which converged on the first three independently) and XCSteward's failure
+# taxonomy. Deliberately absent: the generic "Failed to install or launch the
+# test runner" wrapper, which also wraps permanent failures such as a bad bundle
+# or a bad signature — retrying those just burns another full build.
+
+AAX_RE_RUNNER_INIT='failed to initialize for UI testing|Timed out while loading Accessibility|Application failed preflight checks'
+AAX_RE_SIM_BOOT='Unable to boot the Simulator|Unable to boot device in current state|launchd failed to respond|Failed to start launchd_sim|Timed out waiting for the simulator'
+AAX_RE_RUNNER_CRASH='Lost connection to the test manager|early unexpected exit|Restarting after unexpected exit|Failed to load the test bundle|test runner never began'
+AAX_RE_CORESIM='CoreSimulatorService|Unable to lookup in current state|The service is invalid'
+AAX_RE_BUILD_DB='database is locked|unable to attach DB|Build service could not start'
+
+AAX_RE_TEST_FAIL='\*\* TEST FAILED \*\*|Testing failed:'
+AAX_RE_BUILD_FAIL='\*\* BUILD FAILED \*\*|The following build commands failed'
+AAX_RE_SIGNING='requires a development team|Command CodeSign failed|No profiles for|no valid signing identit'
+AAX_RE_DEST='Unable to find a device matching|Unable to find a destination matching|ineligible destinations|Invalid device'
+
+# Echo a class name for a run's captured output. Empty when nothing matched.
+aax_classify() {
+    local log="$1"
+    [ -s "$log" ] || return 0
+    if   grep -qE "$AAX_RE_RUNNER_INIT"  "$log" 2>/dev/null; then echo runner_bootstrap
+    elif grep -qE "$AAX_RE_SIM_BOOT"     "$log" 2>/dev/null; then echo sim_boot
+    elif grep -qE "$AAX_RE_RUNNER_CRASH" "$log" 2>/dev/null; then echo runner_crash
+    elif grep -qE "$AAX_RE_CORESIM"      "$log" 2>/dev/null; then echo coresim
+    elif grep -qE "$AAX_RE_BUILD_DB"     "$log" 2>/dev/null; then echo build_db_lock
+    elif grep -qE "$AAX_RE_SIGNING"      "$log" 2>/dev/null; then echo signing
+    elif grep -qE "$AAX_RE_DEST"         "$log" 2>/dev/null; then echo destination
+    elif grep -qE "$AAX_RE_TEST_FAIL"    "$log" 2>/dev/null; then echo test_failure
+    elif grep -qE "$AAX_RE_BUILD_FAIL"   "$log" 2>/dev/null; then echo build_failure
+    fi
+}
+
+# Is this class an environment failure that a second attempt could clear?
+aax_is_retryable() {
+    case "$1" in
+        runner_bootstrap|sim_boot|runner_crash|coresim|build_db_lock) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 aax_sql() {
@@ -805,14 +858,16 @@ aax_record() {
     local agent="$1" repo="$2" worktree="$3" tool="$4" action="$5" scheme="$6"
     local dest_kind="$7" udid="$8" gkey="$9" dur="${10}" wait_ms="${11}"
     local rc="${12}" outcome="${13}"
+    local fclass="${AAX_FAILURE_CLASS:-}" retried="${AAX_RETRIED:-0}"
     local q
     q="INSERT INTO runs
       (ts,agent,repo,worktree,tool,action,scheme,dest_kind,udid,gkey,
-       duration_ms,lease_wait_ms,exit_code,outcome)
+       duration_ms,lease_wait_ms,exit_code,outcome,failure_class,retried)
       VALUES ($(date +%s),'${agent//\'/\'\'}','${repo//\'/\'\'}',
               '${worktree//\'/\'\'}','${tool//\'/\'\'}','${action//\'/\'\'}',
               '${scheme//\'/\'\'}','${dest_kind//\'/\'\'}','${udid//\'/\'\'}',
-              '${gkey//\'/\'\'}',$dur,$wait_ms,$rc,'${outcome//\'/\'\'}');"
+              '${gkey//\'/\'\'}',$dur,$wait_ms,$rc,'${outcome//\'/\'\'}',
+              '${fclass//\'/\'\'}',$retried);"
     aax_sql "$q"
 }
 
@@ -906,12 +961,23 @@ aax_worktree_slug() {
 # forks a killer rather than depending on GNU coreutils being present.
 AAX_TIMED_OUT=0
 
+# When AAX_LOG is set, both streams are mirrored into it for classification.
+# Process substitution keeps stdout on stdout and stderr on stderr: merging them
+# would corrupt callers that parse the two separately.
+AAX_LOG=""
+
 aax_run() {
     local budget="$1"; shift
     local rc=0 cmd_pid dog_pid
     AAX_TIMED_OUT=0
 
     if [ "$budget" -le 0 ]; then
+        if [ -n "$AAX_LOG" ]; then
+            "$@" > >(tee -a "$AAX_LOG") 2> >(tee -a "$AAX_LOG" >&2)
+            rc=$?
+            wait          # let the tee subshells drain before we read the log
+            return $rc
+        fi
         "$@"
         return $?
     fi
@@ -924,7 +990,11 @@ aax_run() {
     # watchdog that outlives the build (it sleeps through a grace period) would
     # otherwise pin the simulator lease for the whole budget after the build
     # already finished.
-    "$@" 9>&- &
+    if [ -n "$AAX_LOG" ]; then
+        "$@" 9>&- > >(tee -a "$AAX_LOG") 2> >(tee -a "$AAX_LOG" >&2) &
+    else
+        "$@" 9>&- &
+    fi
     cmd_pid=$!
     (
         sleep "$budget"
@@ -944,6 +1014,53 @@ aax_run() {
     [ -s "$marker" ] && AAX_TIMED_OUT=1
     rm -f "$marker"
     return $rc
+}
+
+# Run once, classify the failure, and retry exactly once if the environment —
+# not the code — was what broke. A genuine test or compile failure is returned
+# on the first attempt, preserving its exit status.
+#
+# Set by the last call: AAX_FAILURE_CLASS, AAX_RETRIED.
+AAX_FAILURE_CLASS="" AAX_RETRIED=0
+
+aax_attempt() {
+    local budget="$1"; shift
+    local rc attempt_log
+
+    AAX_FAILURE_CLASS="" AAX_RETRIED=0
+    attempt_log=$(mktemp -t ai-aligned-xcode-log) || { aax_run "$budget" "$@"; return $?; }
+    AAX_LOG="$attempt_log"
+
+    aax_run "$budget" "$@"
+    rc=$?
+
+    if [ "$rc" -ne 0 ] && [ "$AAX_TIMED_OUT" != "1" ]; then
+        AAX_FAILURE_CLASS=$(aax_classify "$attempt_log")
+        if [ "${AI_ALIGNED_XCODE_NO_RETRY:-false}" != "true" ] \
+           && aax_is_retryable "$AAX_FAILURE_CLASS"; then
+            aax_notice "$AAX_FAILURE_CLASS: the simulator environment failed before your code ran; retrying once"
+
+            # A wedged device is the common cause, and we hold its lease, so
+            # bouncing it is safe. shutdown only — erase would destroy app state
+            # the caller may be relying on.
+            if [ "$AAX_FAILURE_CLASS" = "sim_boot" ] || [ "$AAX_FAILURE_CLASS" = "coresim" ]; then
+                if [ -n "$AAX_UDID" ]; then
+                    aax_notice "shutting down $AAX_UDID before the retry"
+                    AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl shutdown "$AAX_UDID" >/dev/null 2>&1
+                fi
+            fi
+
+            : > "$attempt_log"
+            AAX_RETRIED=1
+            aax_run "$budget" "$@"
+            rc=$?
+            [ "$rc" -ne 0 ] && AAX_FAILURE_CLASS=$(aax_classify "$attempt_log")
+        fi
+    fi
+
+    AAX_LOG=""
+    rm -f "$attempt_log"
+    return "$rc"
 }
 
 # ---------------------------------------------------------------- the gate
@@ -1074,12 +1191,12 @@ aax_shim_xcodebuild() {
 
         if [ -z "$outcome" ]; then
             start=$(date +%s000)     # time the run, not the wait
-            aax_run "$budget" "$real" "${argv[@]}"
+            aax_attempt "$budget" "$real" "${argv[@]}"
             rc=$?
         fi
         exec 9>&-
     else
-        aax_run "$budget" "$real" "${argv[@]}"
+        aax_attempt "$budget" "$real" "${argv[@]}"
         rc=$?
     fi
 
@@ -1166,7 +1283,9 @@ aax_shim_recorded() {
 
     export AI_ALIGNED_XCODE_ACTIVE=1
     start=$(date +%s000)
-    aax_run "$budget" "$real" "$@"
+    # Classified too: `swift build` can lose to a concurrent build-database lock
+    # just as xcodebuild can, and that is worth one retry.
+    aax_attempt "$budget" "$real" "$@"
     rc=$?
     dur=$(( $(date +%s000) - start ))
 
@@ -1200,6 +1319,19 @@ SELECT gkey AS key, n,
        SUM(CASE WHEN outcome<>'ok' THEN 1 ELSE 0 END)                     AS fails
   FROM ranked GROUP BY gkey, n ORDER BY n DESC;"
             ;;
+        failures)
+            aax_db_init
+            aax_sql -header -column "
+SELECT COALESCE(NULLIF(failure_class,''),'(unclassified)') AS class,
+       COUNT(*)                                           AS n,
+       SUM(retried)                                       AS retried,
+       CASE WHEN COALESCE(NULLIF(failure_class,''),'x') IN
+                 ('runner_bootstrap','sim_boot','runner_crash','coresim','build_db_lock')
+            THEN 'infrastructure' ELSE 'your code' END    AS kind
+  FROM runs
+ WHERE outcome <> 'ok'
+ GROUP BY class ORDER BY n DESC;"
+            ;;
         leases)
             echo "held simulator leases:"
             for f in "$AAX_LEASES"/*.lock; do
@@ -1229,15 +1361,17 @@ ai-aligned-xcode $VERSION
 Transparent Xcode toolchain shim for coding agents. Installed as xcodebuild,
 xcrun, swift and xcodegen earlier on PATH; there is nothing to teach the agent.
 
-  ai-aligned-xcode stats    per-key runtime history feeding the predictor
-  ai-aligned-xcode leases   which simulators are currently leased
-  ai-aligned-xcode doctor   environment check
+  ai-aligned-xcode stats     per-key runtime history feeding the predictor
+  ai-aligned-xcode failures  failure classes, and which were infrastructure
+  ai-aligned-xcode leases    which simulators are currently leased
+  ai-aligned-xcode doctor    environment check
   ai-aligned-xcode version
 
 Environment:
   TIMEOUT=<seconds>                  budget for this run (bypasses the gate)
   AI_ALIGNED_XCODE_DISABLE=true      pass everything through untouched
   AI_ALIGNED_XCODE_BUDGET=<seconds>  gate threshold (default 300)
+  AI_ALIGNED_XCODE_NO_RETRY=true     never retry infrastructure failures
   AI_ALIGNED_XCODE_DEBUG=true        trace decisions to stderr
 EOF
             ;;

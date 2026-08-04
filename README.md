@@ -41,7 +41,11 @@ whole agent turn, so the workaround also burns context and cache.
    history; if the median exceeds the budget (default 300 s) it fails with
    `EX_CONFIG` and a paste-ready command, rather than letting the agent start
    something its harness will kill halfway through.
-4. **Records every run** in SQLite, which is what makes (3) work.
+4. **Retries infrastructure failures, once.** Separates "the simulator broke
+   before your code ran" from "your code is wrong", and re-runs only the
+   former. A genuine test or compile failure returns on the first attempt with
+   its exit status intact.
+5. **Records every run** in SQLite, which is what makes (3) and (4) work.
 
 Only simulator-bound work takes a lease. `generic/platform=…`, macOS and
 `-showBuildSettings` runs stay fully parallel, and read-only queries
@@ -90,10 +94,39 @@ what you are signing up for:
 the budget, and you get partial output plus a clear timeout status instead of a
 silent truncation.
 
+### Failure classes
+
+`xcodebuild test` failed 31.9 % of the time in the observed corpus, and a
+meaningful share of those never reached an assertion. Runs are classified so the
+two are not confused:
+
+| class | retried | meaning |
+| --- | --- | --- |
+| `runner_bootstrap` | yes | UI-test runner died at init (accessibility load, preflight checks) |
+| `sim_boot` | yes | simulator would not boot, or `launchd_sim` never answered |
+| `runner_crash` | yes | lost the test manager, or the bundle failed to load |
+| `coresim` | yes | CoreSimulatorService wedged |
+| `build_db_lock` | yes | lost a race on the build database |
+| `test_failure` | no | your tests failed |
+| `build_failure` | no | your code did not compile |
+| `signing` | no | certificate or provisioning problem |
+| `destination` | no | no such device or destination |
+
+A retried run records the class that provoked it, so a green build still tells
+you the environment hiccuped. Disable with `AI_ALIGNED_XCODE_NO_RETRY=true`.
+
+Deliberately *not* retried: the generic `Failed to install or launch the test
+runner` wrapper, which also covers permanent failures like a bad bundle or a bad
+signature. Retrying those just burns another full build.
+
+For `sim_boot` and `coresim` the leased device is shut down before the retry —
+never erased, which would destroy app state the caller may need.
+
 ### Inspection
 
 ```bash
 ai-aligned-xcode stats     # runtime history per scheme/action/destination
+ai-aligned-xcode failures  # failure classes, and which were infrastructure
 ai-aligned-xcode leases    # which simulators are currently leased
 ai-aligned-xcode doctor    # environment check
 ```
@@ -107,6 +140,7 @@ ai-aligned-xcode doctor    # environment check
 | `AI_ALIGNED_XCODE_BUDGET=<seconds>` | gate threshold (default `300`) |
 | `AI_ALIGNED_XCODE_LEASE_WAIT=<seconds>` | max lease wait (default `1800`) |
 | `AI_ALIGNED_XCODE_MIN_SAMPLES=<n>` | samples before the predictor is trusted (default `3`) |
+| `AI_ALIGNED_XCODE_NO_RETRY=true` | never retry infrastructure failures |
 | `AI_ALIGNED_XCODE_HOME=<dir>` | state directory (default `~/.ai-aligned-xcode`) |
 | `AI_ALIGNED_XCODE_DEBUG=true` | trace decisions to stderr |
 | `AMI_PASSTHROUGH=true` | force "not an agent" |
@@ -140,10 +174,15 @@ is keyed on the **destination UDID** rather than on "an `xcodebuild` is running"
 
 [XCSteward](https://xcsteward.com) reaches the same diagnosis — lease-backed
 simulator locks, per-job DerivedData, readiness checks, a documented
-`runner_bootstrap_failure` class — and is worth reading. It is opt-in: agents
-must call `xcsteward submit --project <name>` against a TOML profile. This tool
-takes the opposite integration bet: shadow the real commands so nothing needs
-teaching. The two are complementary.
+`runner_bootstrap_failure` class — and is worth reading; its failure taxonomy
+informed the classes above. It is opt-in: agents must call
+`xcsteward submit --project <name>` against a TOML profile. This tool takes the
+opposite integration bet: shadow the real commands so nothing needs teaching.
+The two are complementary.
+
+The retry signatures also come from slicc's `swift-coverage-runner-retry.sh`,
+which converged on the same three runner-init strings independently — good
+evidence they are the right ones.
 
 Apple's Xcode 27 Agent Skills are instruction files and cover neither simulator
 management nor build execution.
