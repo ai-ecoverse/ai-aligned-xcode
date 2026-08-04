@@ -5,13 +5,21 @@
 # Copies the shim to ~/.local/bin and symlinks it as xcodebuild, xcrun, swift
 # and xcodegen. The shims only take effect if ~/.local/bin precedes the real
 # tools on PATH, so this verifies the ordering rather than assuming it.
+#
+# Supports both local installation and curl | sh:
+#   curl -fsSL https://raw.githubusercontent.com/ai-ecoverse/ai-aligned-xcode/main/install.sh | sh
 
 set -euo pipefail
 
 INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SOURCE="$SCRIPT_DIR/executable_ai-aligned-xcode"
+RAW_BASE_URL="https://raw.githubusercontent.com/ai-ecoverse/ai-aligned-xcode/main"
+SOURCE_SCRIPT="executable_ai-aligned-xcode"
 SHIMS=(xcodebuild xcrun swift xcodegen)
+
+# BASH_SOURCE is unset when piped from curl, so fall back to the cwd and let
+# the download path below handle a missing local copy.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || pwd)"
+SOURCE="$SCRIPT_DIR/$SOURCE_SCRIPT"
 
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
 say()  { printf '%s\n' "$*"; }
@@ -20,13 +28,26 @@ warn() { printf '%s!%s %s\n' "$YELLOW" "$NC" "$*"; }
 die()  { printf '%s✗%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 
 [ "$(uname -s)" = "Darwin" ] || die "ai-aligned-xcode is macOS-only (found $(uname -s))"
-[ -r "$SOURCE" ] || die "cannot read $SOURCE"
 
 say "Installing ai-aligned-xcode to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
-install -m 0755 "$SOURCE" "$INSTALL_DIR/ai-aligned-xcode"
-ok "installed ai-aligned-xcode"
+if [ -r "$SOURCE" ]; then
+    install -m 0755 "$SOURCE" "$INSTALL_DIR/ai-aligned-xcode"
+    ok "installed ai-aligned-xcode from $SOURCE"
+else
+    # Piped from curl, or run outside a checkout: fetch the shim.
+    say "No local copy found; downloading from $RAW_BASE_URL"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$RAW_BASE_URL/$SOURCE_SCRIPT" -o "$INSTALL_DIR/ai-aligned-xcode"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$INSTALL_DIR/ai-aligned-xcode" "$RAW_BASE_URL/$SOURCE_SCRIPT"
+    else
+        die "neither curl nor wget is available"
+    fi
+    chmod 0755 "$INSTALL_DIR/ai-aligned-xcode"
+    ok "downloaded and installed ai-aligned-xcode"
+fi
 
 for tool in "${SHIMS[@]}"; do
     target="$INSTALL_DIR/$tool"
