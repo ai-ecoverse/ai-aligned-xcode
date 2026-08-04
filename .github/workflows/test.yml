@@ -1,0 +1,33 @@
+name: Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    # macOS runners ship Xcode, lockf(1) and sqlite3, which the shim needs.
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Show toolchain
+      run: |
+        sw_vers
+        xcodebuild -version
+        /usr/bin/sqlite3 --version
+        test -x /usr/bin/lockf && echo "lockf: ok"
+
+    - name: Run installation
+      run: ./install.sh
+
+    - name: Run tests
+      run: ./test.sh
+
+    - name: Verify humans are not intercepted
+      run: |
+        # With no agent markers in the environment the shim must be inert.
+        env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT \
+          AMI_PASSTHROUGH=true "$HOME/.local/bin/xcodebuild" -version

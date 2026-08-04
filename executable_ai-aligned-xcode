@@ -1,0 +1,684 @@
+#!/bin/bash
+#
+# ai-aligned-xcode - transparent Xcode toolchain shim for coding agents
+#
+# Installed as xcodebuild / xcrun / swift / xcodegen earlier on PATH than the
+# real tools. Dispatches on $0. When the caller is a coding agent it:
+#
+#   1. Takes an exclusive lease on the destination simulator (UDID-keyed), so
+#      parallel agents serialise on the device instead of colliding on it.
+#   2. Injects a per-worktree -derivedDataPath so parallel checkouts stop
+#      sharing one DerivedData.
+#   3. Predicts the runtime from recorded history and refuses invocations whose
+#      median exceeds the budget unless the caller sets TIMEOUT, so an agent
+#      never unknowingly signs up for a run its harness will kill.
+#   4. Records every run in SQLite to feed (3).
+#
+# Humans get an untouched pass-through.
+#
+# See: https://github.com/ai-ecoverse/ai-aligned-xcode
+
+VERSION="0.1.0"
+
+# ---------------------------------------------------------------- configuration
+
+AAX_HOME="${AI_ALIGNED_XCODE_HOME:-$HOME/.ai-aligned-xcode}"
+AAX_DB="$AAX_HOME/runs.db"
+AAX_LEASES="$AAX_HOME/leases"
+AAX_DD="$AAX_HOME/derived"
+AAX_CACHE="$AAX_HOME/cache"
+
+# Refuse a run whose predicted median exceeds this (seconds) unless TIMEOUT is set.
+AAX_BUDGET="${AI_ALIGNED_XCODE_BUDGET:-300}"
+# How long to wait for a simulator lease before giving up (seconds).
+AAX_LEASE_WAIT="${AI_ALIGNED_XCODE_LEASE_WAIT:-1800}"
+# Minimum samples before the predictor is trusted.
+AAX_MIN_SAMPLES="${AI_ALIGNED_XCODE_MIN_SAMPLES:-3}"
+# Set to "true" to pass everything through untouched.
+AAX_DISABLE="${AI_ALIGNED_XCODE_DISABLE:-false}"
+
+DEBUG="${AI_ALIGNED_XCODE_DEBUG:-false}"
+
+aax_debug() {
+    [ "$DEBUG" = "true" ] && echo "[ai-aligned-xcode] $*" >&2
+    return 0
+}
+
+# Corrective notices go to stderr so they land in the agent's tool output
+# without polluting stdout, which callers parse.
+aax_notice() {
+    echo "ai-aligned-xcode: $*" >&2
+}
+
+# @bundle:am-i-ai
+
+# Dev fallback: when the bundler has not run, use a sibling am-i-ai checkout.
+if ! declare -f ami_detect >/dev/null 2>&1; then
+    _aax_self="${BASH_SOURCE[0]}"
+    while [ -L "$_aax_self" ]; do _aax_self="$(readlink "$_aax_self")"; done
+    _aax_dir="$(cd "$(dirname "$_aax_self")" && pwd)"
+    for _cand in "$_aax_dir/../am-i-ai/am-i-ai.sh" \
+                 "$HOME/Developer/ai-ecoverse/am-i-ai/am-i-ai.sh"; do
+        # shellcheck source=/dev/null
+        [ -r "$_cand" ] && . "$_cand" && break
+    done
+    unset _aax_self _aax_dir _cand
+fi
+
+# Last-resort fallback: environment-only detection (no process-tree walk).
+if ! declare -f ami_detect >/dev/null 2>&1; then
+    ami_detect() {
+        if [ -n "$CLAUDECODE" ]; then echo claude
+        elif [ -n "$DROID_CLI" ]; then echo droid
+        elif [ -n "$AUGMENT_API_TOKEN" ]; then echo auggie
+        elif [ -n "$CURSOR_AGENT" ]; then echo cursor
+        elif [ -n "$CODEX_CLI" ] || [ -n "$CODEX_SANDBOX" ]; then echo codex
+        elif [ -n "$GEMINI_CLI" ]; then echo gemini
+        else echo none
+        fi
+    }
+fi
+
+# ---------------------------------------------------------------- detection cache
+#
+# ami_detect's process-tree walk costs ~54ms — 8x a real xcrun call. The answer
+# is stable for the life of a session, so memoise it against the session's
+# ancestry rather than paying it per invocation.
+
+aax_session_key() {
+    local pid=$PPID depth=0 chain=""
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$depth" -lt 8 ]; do
+        chain="$chain:$pid"
+        pid=$(ps -p "$pid" -o ppid= 2>/dev/null | tr -d ' ')
+        depth=$((depth + 1))
+    done
+    echo "${chain#:}" | tr -d ' /' | cksum | cut -d' ' -f1
+}
+
+aax_agent() {
+    local key cache
+    # Honour the opt-out before consulting the cache, or a memoised "claude"
+    # would outlive an explicit AMI_PASSTHROUGH.
+    if [ "${AMI_PASSTHROUGH:-}" = "true" ]; then
+        printf 'none'
+        return 0
+    fi
+    key=$(aax_session_key)
+    cache="$AAX_CACHE/agent-$key"
+    if [ -r "$cache" ]; then
+        cat "$cache"
+        return 0
+    fi
+    local agent
+    agent=$(ami_detect 2>/dev/null || echo none)
+    mkdir -p "$AAX_CACHE" 2>/dev/null
+    printf '%s' "$agent" > "$cache" 2>/dev/null
+    printf '%s' "$agent"
+}
+
+# ---------------------------------------------------------------- real tool lookup
+
+# Resolve the genuine binary, skipping any directory containing our shim.
+aax_real_tool() {
+    local name="$1" self_dir candidate
+    self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    case "$name" in
+        xcodebuild|xcrun|xcode-select) echo "/usr/bin/$name"; return 0 ;;
+    esac
+
+    local IFS=:
+    for candidate in $PATH; do
+        [ -z "$candidate" ] && continue
+        [ "$(cd "$candidate" 2>/dev/null && pwd)" = "$self_dir" ] && continue
+        if [ -x "$candidate/$name" ] && [ ! -L "$candidate/$name" ]; then
+            echo "$candidate/$name"; return 0
+        fi
+        if [ -x "$candidate/$name" ]; then
+            local target
+            target="$(readlink "$candidate/$name")"
+            case "$target" in
+                *ai-aligned-xcode*) continue ;;
+                *) echo "$candidate/$name"; return 0 ;;
+            esac
+        fi
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------- sqlite store
+
+aax_db_init() {
+    mkdir -p "$AAX_HOME" 2>/dev/null
+    # Idempotent, and deliberately not guarded on the file existing: any query
+    # creates an empty database file, so file presence does not imply a schema.
+    # stdout is discarded because "PRAGMA journal_mode" echoes "wal", which
+    # would otherwise land in the wrapped tool's output.
+    /usr/bin/sqlite3 "$AAX_DB" >/dev/null 2>&1 <<'SQL'
+PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS runs (
+  id            INTEGER PRIMARY KEY,
+  ts            INTEGER NOT NULL,
+  agent         TEXT    NOT NULL,
+  repo          TEXT    NOT NULL,
+  worktree      TEXT    NOT NULL,
+  tool          TEXT    NOT NULL,
+  action        TEXT    NOT NULL,
+  scheme        TEXT,
+  dest_kind     TEXT,
+  udid          TEXT,
+  gkey          TEXT    NOT NULL,
+  duration_ms   INTEGER,
+  lease_wait_ms INTEGER,
+  exit_code     INTEGER,
+  outcome       TEXT
+);
+CREATE INDEX IF NOT EXISTS runs_gkey ON runs(gkey, ts);
+SQL
+}
+
+aax_sql() {
+    # .timeout rather than "PRAGMA busy_timeout" — the pragma echoes its value
+    # onto stdout, which would corrupt the wrapped tool's output.
+    /usr/bin/sqlite3 -cmd ".timeout 5000" "$AAX_DB" "$@" 2>/dev/null
+}
+
+# Median duration for a grouping key over its most recent samples.
+# Echoes milliseconds, or nothing when there is not enough history.
+aax_predict() {
+    local gkey="$1" esc
+    esc=${gkey//\'/\'\'}
+    aax_sql "
+WITH recent AS (
+  SELECT duration_ms FROM runs
+   WHERE gkey='$esc' AND duration_ms IS NOT NULL
+     AND outcome IN ('ok','fail')
+   ORDER BY ts DESC LIMIT 20
+), ranked AS (
+  SELECT duration_ms,
+         ROW_NUMBER() OVER (ORDER BY duration_ms) rn,
+         COUNT(*)     OVER ()                     n
+    FROM recent
+)
+SELECT CASE WHEN n >= $AAX_MIN_SAMPLES
+            THEN MAX(CASE WHEN rn = (n+1)/2 THEN duration_ms END)
+       END
+  FROM ranked;"
+}
+
+aax_record() {
+    local agent="$1" repo="$2" worktree="$3" tool="$4" action="$5" scheme="$6"
+    local dest_kind="$7" udid="$8" gkey="$9" dur="${10}" wait_ms="${11}"
+    local rc="${12}" outcome="${13}"
+    local q
+    q="INSERT INTO runs
+      (ts,agent,repo,worktree,tool,action,scheme,dest_kind,udid,gkey,
+       duration_ms,lease_wait_ms,exit_code,outcome)
+      VALUES ($(date +%s),'${agent//\'/\'\'}','${repo//\'/\'\'}',
+              '${worktree//\'/\'\'}','${tool//\'/\'\'}','${action//\'/\'\'}',
+              '${scheme//\'/\'\'}','${dest_kind//\'/\'\'}','${udid//\'/\'\'}',
+              '${gkey//\'/\'\'}',$dur,$wait_ms,$rc,'${outcome//\'/\'\'}');"
+    aax_sql "$q"
+}
+
+# ---------------------------------------------------------------- argv parsing
+
+AAX_ACTION="" AAX_SCHEME="" AAX_DEST="" AAX_DDP="" AAX_PROJECT="" AAX_NO_LEASE=0
+
+aax_parse_xcodebuild() {
+    local prev="" a
+    for a in "$@"; do
+        # Reports build settings without running a build: needs the same
+        # DerivedData for path consistency, but must not hold the device.
+        [ "$a" = "-showBuildSettings" ] && AAX_NO_LEASE=1
+        case "$prev" in
+            -scheme)          AAX_SCHEME="$a" ;;
+            -destination)     AAX_DEST="$a" ;;
+            -derivedDataPath) AAX_DDP="$a" ;;
+            -project|-workspace) AAX_PROJECT="$a" ;;
+        esac
+        case "$a" in
+            build|test|archive|clean|analyze|install|build-for-testing|\
+            test-without-building|docbuild)
+                [ -z "$AAX_ACTION" ] && AAX_ACTION="$a" ;;
+        esac
+        prev="$a"
+    done
+    [ -z "$AAX_ACTION" ] && AAX_ACTION="build"
+}
+
+# Classify -destination into sim / generic / device / none, and resolve a UDID.
+AAX_DEST_KIND="none" AAX_UDID=""
+
+aax_resolve_destination() {
+    local dest="$1"
+    if [ -z "$dest" ]; then AAX_DEST_KIND="none"; return 0; fi
+    case "$dest" in
+        generic/*) AAX_DEST_KIND="generic"; return 0 ;;
+    esac
+    case "$dest" in
+        *id=*)
+            AAX_UDID=$(echo "$dest" | sed -n 's/.*id=\([0-9A-Fa-f-]\{36\}\).*/\1/p')
+            if [ -n "$AAX_UDID" ]; then AAX_DEST_KIND="sim"; return 0; fi
+            # A non-UUID id= is a physical device ECID.
+            AAX_DEST_KIND="device"; return 0 ;;
+    esac
+    case "$dest" in
+        *"iOS Simulator"*|*"watchOS Simulator"*|*"tvOS Simulator"*|*"visionOS Simulator"*)
+            AAX_DEST_KIND="sim"
+            AAX_UDID=$(aax_resolve_name_to_udid "$dest")
+            return 0 ;;
+        *platform=macOS*|*platform=OS\ X*) AAX_DEST_KIND="none"; return 0 ;;
+    esac
+    AAX_DEST_KIND="device"
+}
+
+# Map a name=/OS= destination onto a concrete UDID.
+#
+# simctl's JSON dict order is unspecified, so sort runtimes by version rather
+# than taking the first — an older runtime can fail at launch on a missing
+# libswiftWebKit.dylib. (Learned the hard way in slicc's docs/ios-simulator-qa.md.)
+aax_resolve_name_to_udid() {
+    local dest="$1" name
+    name=$(echo "$dest" | sed -n 's/.*name=\([^,]*\).*/\1/p')
+    [ -z "$name" ] && return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices available --json 2>/dev/null \
+      | jq -r --arg n "$name" '
+          [ .devices | to_entries[]
+            | select(.key | test("SimRuntime"))
+            | { ver: (.key | capture("-(?<v>[0-9]+(-[0-9]+)*)$").v
+                          | split("-") | map(tonumber)),
+                devs: [ .value[] | select(.isAvailable and .name == $n) ] }
+            | select(.devs | length > 0) ]
+          | sort_by(.ver) | last | .devs | first | .udid // empty' 2>/dev/null
+}
+
+# ---------------------------------------------------------------- worktree identity
+
+aax_repo_root() {
+    git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+aax_worktree_slug() {
+    local root="$1"
+    printf '%s' "$root" | tr -d ' ' | cksum | cut -d' ' -f1
+}
+
+# ---------------------------------------------------------------- execution
+
+# Run a command under an optional watchdog. macOS ships no timeout(1), so this
+# forks a killer rather than depending on GNU coreutils being present.
+AAX_TIMED_OUT=0
+
+aax_run() {
+    local budget="$1"; shift
+    local rc=0 cmd_pid dog_pid
+    AAX_TIMED_OUT=0
+
+    if [ "$budget" -le 0 ]; then
+        "$@"
+        return $?
+    fi
+
+    local marker
+    marker=$(mktemp -t ai-aligned-xcode-dog) || return 1
+
+    # 9>&- closes the inherited lease descriptor in both children. An flock is
+    # released only when every fd on the open file description is closed, so a
+    # watchdog that outlives the build (it sleeps through a grace period) would
+    # otherwise pin the simulator lease for the whole budget after the build
+    # already finished.
+    "$@" 9>&- &
+    cmd_pid=$!
+    (
+        sleep "$budget"
+        # Record the fact of firing: liveness of the watchdog itself cannot be
+        # used as the signal, because it stays alive through the grace period.
+        kill -TERM "$cmd_pid" 2>/dev/null && printf 1 > "$marker"
+        sleep 10
+        kill -KILL "$cmd_pid" 2>/dev/null
+    ) 9>&- &
+    dog_pid=$!
+
+    # Braces + redirect suppress bash's asynchronous "Terminated: 15" job
+    # notice, which would otherwise be mistaken for tool output.
+    { wait "$cmd_pid"; rc=$?; } 2>/dev/null
+    kill "$dog_pid" 2>/dev/null
+    { wait "$dog_pid"; } 2>/dev/null
+    [ -s "$marker" ] && AAX_TIMED_OUT=1
+    rm -f "$marker"
+    return $rc
+}
+
+# ---------------------------------------------------------------- the gate
+
+# Quote an argv back into something the caller can paste verbatim.
+aax_quote_cmd() {
+    local out="" a
+    for a in "$@"; do
+        case "$a" in
+            *[![:alnum:]_/.=:-]*) out="$out '${a//\'/\'\\\'\'}'" ;;
+            *) out="$out $a" ;;
+        esac
+    done
+    printf '%s' "${out# }"
+}
+
+# Refuse a run the caller has not budgeted for. Returns 1 to abort.
+# Echoes back the caller's ORIGINAL argv, not our rewritten one — they should
+# re-run their own command, not ours.
+aax_check_budget() {
+    local gkey="$1" tool="$2"; shift 2
+    local median
+
+    if [ -n "$TIMEOUT" ]; then
+        return 0
+    fi
+
+    median=$(aax_predict "$gkey")
+    [ -z "$median" ] && return 0
+    [ "$median" -le $((AAX_BUDGET * 1000)) ] && return 0
+
+    local med_s=$((median / 1000)) suggest=$(( (median / 1000) * 2 ))
+    local orig; orig=$(aax_quote_cmd "$tool" "$@")
+    cat >&2 <<EOF
+ai-aligned-xcode: refusing to start an unbudgeted long run.
+
+  command   : $tool $AAX_ACTION${AAX_SCHEME:+ -scheme $AAX_SCHEME}
+  predicted : ~${med_s}s (median of recent runs for this scheme/action/destination)
+  budget    : ${AAX_BUDGET}s
+
+This run will most likely outlive your harness's command timeout, and you will
+lose the output rather than the work. Re-run with an explicit budget so you know
+what you are signing up for:
+
+  TIMEOUT=${suggest} ${orig}
+
+TIMEOUT is in seconds. The run is killed if it exceeds it, and you get partial
+output plus a clear timeout status instead of a silent truncation.
+EOF
+    return 1
+}
+
+# ---------------------------------------------------------------- xcodebuild shim
+
+aax_shim_xcodebuild() {
+    local real agent repo worktree gkey lease_file
+    local start end dur wait_ms=0 rc outcome lease_start
+
+    real=$(aax_real_tool xcodebuild) || { echo "ai-aligned-xcode: cannot find real xcodebuild" >&2; exit 127; }
+
+    # Read-only queries are fast and touch nothing. They must stay pristine —
+    # callers parse their stdout.
+    local a
+    for a in "$@"; do
+        case "$a" in
+            -version|-usage|-help|-list|-showsdks|-showdestinations|\
+            -showTestPlans|-checkFirstLaunchStatus)
+                exec "$real" "$@" ;;
+        esac
+    done
+
+    aax_parse_xcodebuild "$@"
+    aax_resolve_destination "$AAX_DEST"
+
+    repo=$(aax_repo_root)
+    worktree=$(aax_worktree_slug "$repo")
+    agent=$(aax_agent)
+    # A monorepo can hold several .xcodeproj, so the project is part of the key.
+    gkey="$(basename "$repo")|$(basename "${AAX_PROJECT:-.}")|xcodebuild|$AAX_ACTION|$AAX_SCHEME|$AAX_DEST_KIND"
+
+    # (3) Budget gate runs first, so a refused run emits one clear reason
+    # instead of a rewrite notice followed by a refusal. The schema must exist
+    # before the predictor queries it.
+    aax_db_init
+    aax_check_budget "$gkey" xcodebuild "$@" || exit 78
+
+    local -a argv=("$@")
+
+    # (2) Per-worktree DerivedData. 894 of 1153 observed xcodebuild calls omitted
+    # this, so parallel checkouts collided in the default location.
+    if [ -z "$AAX_DDP" ] && [ "$AAX_ACTION" != "clean" ]; then
+        local dd
+        dd="$AAX_DD/$(basename "$repo")-$worktree"
+        mkdir -p "$dd" 2>/dev/null
+        argv+=(-derivedDataPath "$dd")
+        aax_notice "using per-worktree DerivedData: $dd"
+    fi
+
+    # (1) Simulator lease. Only when a real device is involved; generic and
+    # macOS destinations run fully parallel.
+    local budget=0
+    [ -n "$TIMEOUT" ] && budget="$TIMEOUT"
+
+    export AI_ALIGNED_XCODE_ACTIVE=1
+    start=$(date +%s000)
+
+    if [ "$AAX_DEST_KIND" = "sim" ] && [ -n "$AAX_UDID" ] && [ "$AAX_NO_LEASE" = "0" ]; then
+        mkdir -p "$AAX_LEASES" 2>/dev/null
+        lease_file="$AAX_LEASES/$AAX_UDID.lock"
+
+        # The lock is held on fd 9 by THIS process: lockf(1) exits immediately,
+        # but the flock(2) lives on the open file description, which our fd
+        # keeps alive until we close it. Holding it here (rather than re-exec'ing
+        # under `lockf <file> <cmd>`) keeps the watchdog and the timing in the
+        # same process, and means the agent's single tool call absorbs the wait.
+        # Returning "busy, retry later" is what produced the poll loops this
+        # tool exists to remove.
+        exec 9>>"$lease_file"
+        if ! /usr/bin/lockf -s -t 0 9; then
+            aax_notice "simulator $AAX_UDID is leased by another run; waiting (up to ${AAX_LEASE_WAIT}s)"
+            lease_start=$(date +%s)
+            if ! /usr/bin/lockf -s -t "$AAX_LEASE_WAIT" 9; then
+                aax_notice "gave up waiting for simulator $AAX_UDID after ${AAX_LEASE_WAIT}s"
+                outcome="lease_timeout"; rc=75
+            fi
+            wait_ms=$(( ($(date +%s) - lease_start) * 1000 ))
+        fi
+
+        if [ -z "$outcome" ]; then
+            start=$(date +%s000)     # time the run, not the wait
+            aax_run "$budget" "$real" "${argv[@]}"
+            rc=$?
+        fi
+        exec 9>&-
+    else
+        aax_run "$budget" "$real" "${argv[@]}"
+        rc=$?
+    fi
+
+    end=$(date +%s000); dur=$((end - start))
+    if [ -z "$outcome" ]; then
+        if [ "$AAX_TIMED_OUT" = "1" ]; then
+            outcome="timeout"
+            aax_notice "killed after ${budget}s (TIMEOUT budget reached)"
+        elif [ "$rc" -eq 0 ]; then outcome="ok"
+        else outcome="fail"
+        fi
+    fi
+
+    aax_record "$agent" "$(basename "$repo")" "$worktree" xcodebuild "$AAX_ACTION" \
+               "$AAX_SCHEME" "$AAX_DEST_KIND" "$AAX_UDID" "$gkey" \
+               "$dur" "$wait_ms" "$rc" "$outcome"
+    exit "$rc"
+}
+
+# ---------------------------------------------------------------- xcrun shim
+
+# simctl subcommands that mutate device state and therefore need the lease.
+AAX_SIMCTL_MUTATING=" boot shutdown erase install uninstall launch terminate openurl privacy keychain "
+
+aax_shim_xcrun() {
+    local real="/usr/bin/xcrun"
+
+    # Fast path: anything that is not a state-mutating simctl call passes
+    # straight through. xcrun is called ~1140 times in the corpus, mostly for
+    # trivial lookups.
+    if [ "$1" != "simctl" ]; then
+        exec "$real" "$@"
+    fi
+
+    local sub="$2" udid="$3"
+    case "$AAX_SIMCTL_MUTATING" in
+        *" $sub "*) ;;
+        *) exec "$real" "$@" ;;
+    esac
+
+    # simctl takes the UDID (or "booted"/"all") as the first operand.
+    case "$udid" in
+        [0-9A-Fa-f]*-*) ;;
+        *) exec "$real" "$@" ;;
+    esac
+
+    aax_db_init
+    local agent repo start dur rc lease_file
+    agent=$(aax_agent); repo=$(aax_repo_root)
+    mkdir -p "$AAX_LEASES" 2>/dev/null
+    lease_file="$AAX_LEASES/$udid.lock"
+
+    export AI_ALIGNED_XCODE_ACTIVE=1
+    start=$(date +%s000)
+    /usr/bin/lockf -k -t "$AAX_LEASE_WAIT" "$lease_file" "$real" "$@"
+    rc=$?
+    dur=$(( $(date +%s000) - start ))
+
+    aax_record "$agent" "$(basename "$repo")" "$(aax_worktree_slug "$repo")" \
+               simctl "$sub" "" sim "$udid" \
+               "$(basename "$repo")|simctl|$sub||sim" \
+               "$dur" 0 "$rc" "$([ "$rc" -eq 0 ] && echo ok || echo fail)"
+    exit "$rc"
+}
+
+# ---------------------------------------------------------------- swift / xcodegen
+
+# Neither touches a simulator, so they take no lease. They are recorded because
+# the predictor needs their history too.
+aax_shim_recorded() {
+    local tool="$1"; shift
+    local real agent repo gkey start dur rc action="${1:-run}"
+
+    real=$(aax_real_tool "$tool") || { echo "ai-aligned-xcode: cannot find real $tool" >&2; exit 127; }
+    aax_db_init
+    agent=$(aax_agent); repo=$(aax_repo_root)
+    gkey="$(basename "$repo")|.|$tool|$action||none"
+
+    AAX_ACTION="$action"
+    aax_check_budget "$gkey" "$tool" "$@" || exit 78
+
+    local budget=0
+    [ -n "$TIMEOUT" ] && budget="$TIMEOUT"
+
+    export AI_ALIGNED_XCODE_ACTIVE=1
+    start=$(date +%s000)
+    aax_run "$budget" "$real" "$@"
+    rc=$?
+    dur=$(( $(date +%s000) - start ))
+
+    local outcome=ok
+    [ "$AAX_TIMED_OUT" = "1" ] && outcome=timeout
+    [ "$rc" -ne 0 ] && [ "$outcome" = "ok" ] && outcome=fail
+
+    aax_record "$agent" "$(basename "$repo")" "$(aax_worktree_slug "$repo")" \
+               "$tool" "$action" "" none "" "$gkey" "$dur" 0 "$rc" "$outcome"
+    exit "$rc"
+}
+
+# ---------------------------------------------------------------- reporting CLI
+
+aax_cli() {
+    case "${1:-help}" in
+        stats)
+            aax_db_init
+            # Keys are printed whole: the distinguishing part (action, scheme,
+            # destination) is the tail, so truncating the head makes distinct
+            # rows look identical.
+            aax_sql -header -column "
+WITH ranked AS (
+  SELECT gkey, duration_ms, outcome,
+         ROW_NUMBER() OVER (PARTITION BY gkey ORDER BY duration_ms) rn,
+         COUNT(*)     OVER (PARTITION BY gkey)                      n
+    FROM runs WHERE duration_ms IS NOT NULL)
+SELECT gkey AS key, n,
+       MAX(CASE WHEN rn=(n+1)/2           THEN duration_ms/1000 END)||'s' AS median,
+       MAX(CASE WHEN rn=MAX(1,(n*9+9)/10) THEN duration_ms/1000 END)||'s' AS p90,
+       SUM(CASE WHEN outcome<>'ok' THEN 1 ELSE 0 END)                     AS fails
+  FROM ranked GROUP BY gkey, n ORDER BY n DESC;"
+            ;;
+        leases)
+            echo "held simulator leases:"
+            for f in "$AAX_LEASES"/*.lock; do
+                [ -e "$f" ] || { echo "  (none)"; break; }
+                if /usr/bin/lockf -k -s -t 0 "$f" true 2>/dev/null; then
+                    echo "  $(basename "$f" .lock)  free"
+                else
+                    echo "  $(basename "$f" .lock)  HELD"
+                fi
+            done
+            ;;
+        doctor)
+            echo "ai-aligned-xcode $VERSION"
+            echo "  state dir     : $AAX_HOME"
+            echo "  detected as   : $(aax_agent)"
+            echo "  real xcodebuild: $(aax_real_tool xcodebuild)"
+            echo "  lockf         : $([ -x /usr/bin/lockf ] && echo ok || echo MISSING)"
+            echo "  sqlite3       : $(/usr/bin/sqlite3 --version 2>/dev/null | cut -d' ' -f1)"
+            echo "  jq            : $(command -v jq >/dev/null && echo ok || echo 'missing (name= destinations will not resolve)')"
+            echo "  runs recorded : $(aax_sql 'SELECT COUNT(*) FROM runs;' 2>/dev/null || echo 0)"
+            ;;
+        version) echo "ai-aligned-xcode $VERSION" ;;
+        *)
+            cat <<EOF
+ai-aligned-xcode $VERSION
+
+Transparent Xcode toolchain shim for coding agents. Installed as xcodebuild,
+xcrun, swift and xcodegen earlier on PATH; there is nothing to teach the agent.
+
+  ai-aligned-xcode stats    per-key runtime history feeding the predictor
+  ai-aligned-xcode leases   which simulators are currently leased
+  ai-aligned-xcode doctor   environment check
+  ai-aligned-xcode version
+
+Environment:
+  TIMEOUT=<seconds>                  budget for this run (bypasses the gate)
+  AI_ALIGNED_XCODE_DISABLE=true      pass everything through untouched
+  AI_ALIGNED_XCODE_BUDGET=<seconds>  gate threshold (default 300)
+  AI_ALIGNED_XCODE_DEBUG=true        trace decisions to stderr
+EOF
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------- entry point
+
+INVOKED_AS="$(basename "$0")"
+# Running the file in place, before chezmoi/install.sh strips the prefix.
+INVOKED_AS="${INVOKED_AS#executable_}"
+
+# Re-entrancy guard. xcodebuild resolves its own toolchain by absolute path so
+# this rarely fires, but a build that does shell out must not re-enter the shim.
+if [ -n "$AI_ALIGNED_XCODE_ACTIVE" ] || [ "$AAX_DISABLE" = "true" ]; then
+    case "$INVOKED_AS" in
+        ai-aligned-xcode) aax_cli "$@"; exit $? ;;
+        *) real=$(aax_real_tool "$INVOKED_AS") && exec "$real" "$@"
+           echo "ai-aligned-xcode: cannot find real $INVOKED_AS" >&2; exit 127 ;;
+    esac
+fi
+
+# Humans get an untouched tool.
+if [ "$INVOKED_AS" != "ai-aligned-xcode" ] && [ "$(aax_agent)" = "none" ]; then
+    aax_debug "no agent detected, passing through"
+    real=$(aax_real_tool "$INVOKED_AS") && exec "$real" "$@"
+    echo "ai-aligned-xcode: cannot find real $INVOKED_AS" >&2; exit 127
+fi
+
+case "$INVOKED_AS" in
+    xcodebuild)       aax_shim_xcodebuild "$@" ;;
+    xcrun)            aax_shim_xcrun "$@" ;;
+    swift)            aax_shim_recorded swift "$@" ;;
+    xcodegen)         aax_shim_recorded xcodegen "$@" ;;
+    ai-aligned-xcode) aax_cli "$@" ;;
+    *)
+        real=$(aax_real_tool "$INVOKED_AS") && exec "$real" "$@"
+        echo "ai-aligned-xcode: unknown invocation '$INVOKED_AS'" >&2; exit 127 ;;
+esac
