@@ -1032,27 +1032,42 @@ aax_device_for() {
     [ -n "$udid" ] && { printf '%s' "$udid"; return 0; }
 
     # A free, untagged one of the same type+runtime.
+    #
+    # Never take a Booted device: something is using it right now, and grabbing
+    # it is the interference this whole tool exists to stop. Prefer stock
+    # product names too — a device called "fix-1916-browser" was made
+    # deliberately for a piece of work and is not spare capacity.
     udid=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json 2>/dev/null \
       | jq -r --arg t "$dtype" --arg r "$runtime" '
-          .devices[$r][]? | select(.isAvailable and .deviceTypeIdentifier==$t
-                                   and (.name | test("\\[[^]]+\\]$") | not)) | .udid' 2>/dev/null | head -1)
+          [ .devices[$r][]?
+            | select(.isAvailable and .deviceTypeIdentifier==$t
+                     and .state == "Shutdown"
+                     and (.name | test("\\[[^]]+\\]$") | not)) ]
+          | sort_by(.name | test("^(iPhone|iPad|Apple) ") | not)
+          | .[0].udid // empty' 2>/dev/null | head -1)
     if [ -n "$udid" ]; then
         base=$(aax_device_base "$(aax_device_info "$udid" | cut -f1)")
         aax_claim_device "$udid" "$base" "$label" 0 && { printf '%s' "$udid"; return 0; }
     fi
 
-    # Pool exhausted for this type+runtime: clone. `reap` cleans these up.
-    local src
-    src=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json 2>/dev/null \
+    # Pool exhausted for this type+runtime: make a new one. `reap` cleans these
+    # up. simctl create, not clone — clone refuses a Booted source, and the one
+    # remaining device of a contended type is very often the booted one. A
+    # fresh device is also cleaner than a copy of someone else's state.
+    # Name it after a stock sibling, not whatever sorts first — a custom device
+    # like "fix-1916-browser" must not become the template for the whole type.
+    base=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json 2>/dev/null \
       | jq -r --arg t "$dtype" --arg r "$runtime" '
-          .devices[$r][]? | select(.isAvailable and .deviceTypeIdentifier==$t) | .udid' 2>/dev/null | head -1)
-    [ -z "$src" ] && return 1
-    base=$(aax_device_base "$(aax_device_info "$src" | cut -f1)")
-    udid=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl clone "$src" "$base [$label]" 2>/dev/null)
+          [ .devices[$r][]? | select(.deviceTypeIdentifier==$t)
+            | (.name | sub(" \\[[^]]+\\]$"; "")) ]
+          | (map(select(test("^(iPhone|iPad|Apple) "))) + .) | .[0] // empty' 2>/dev/null)
+    base=$(aax_device_base "${base:-device}")
+    udid=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl create "$base [$label]" \
+             "$dtype" "$runtime" 2>/dev/null | tr -d '[:space:]')
     [ -z "$udid" ] && return 1
     aax_sql "INSERT OR REPLACE INTO devices(udid,base_name,owner,created_by_aax,claimed_at)
              VALUES('${udid//\'/\'\'}','${base//\'/\'\'}','${label//\'/\'\'}',1,$(date +%s));"
-    aax_notice "simulator pool exhausted for this device type; cloned $base [$label] = $udid"
+    aax_notice "simulator pool exhausted for this device type; created $base [$label] = $udid"
     printf '%s' "$udid"
 }
 
@@ -1629,9 +1644,13 @@ SELECT COALESCE(NULLIF(failure_class,''),'(unclassified)') AS class,
               | jq -r --arg me "$me" '
                   .devices | to_entries[] | .key as $rt | .value[]
                   | select(.isAvailable)
-                  | (.name | capture("^(?<b>.*) \\[(?<o>[^]]+)\\]$") // {b:.name, o:""}) as $n
-                  | [ (if $n.o == "" then "-" elif $n.o == $me then "MINE" else $n.o end),
-                      $n.b, .udid, .state,
+                  # capture/2 emits NOTHING on no-match, which silently drops
+                  # every untagged device. Branch on test/1 instead.
+                  | (.name | test(" \\[[^]]+\\]$")) as $tagged
+                  | (if $tagged then (.name | sub(" \\[[^]]+\\]$"; "")) else .name end) as $base
+                  | (if $tagged then (.name | capture(" \\[(?<o>[^]]+)\\]$").o) else "" end) as $own
+                  | [ (if $own == "" then "-" elif $own == $me then "MINE" else $own end),
+                      $base, .udid, .state,
                       ($rt | sub("com.apple.CoreSimulator.SimRuntime.";"")) ]
                   | @tsv' 2>/dev/null \
               | sort | awk -F'\t' 'BEGIN{printf "%-16s %-26s %-38s %-9s %s\n","OWNER","DEVICE","UDID","STATE","RUNTIME"}

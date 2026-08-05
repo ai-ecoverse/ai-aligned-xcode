@@ -402,12 +402,18 @@ if has_xcode && command -v jq >/dev/null 2>&1; then
         [ $? -ne 78 ] && ok "NO_OWNERSHIP bypasses the check" \
                       || no "NO_OWNERSHIP bypasses the check" "still denied"
 
-        # release must restore every borrowed stock device.
+        # release restores borrowed devices; reap removes ones we created. The
+        # deny path may have created a device when the pool was exhausted, so
+        # teardown needs both or the suite leaks simulators onto the machine.
         ai-aligned-xcode release --apply >/dev/null 2>&1
+        borrowed_left=$(/usr/bin/xcrun simctl list devices --json 2>/dev/null \
+               | jq -r '[.devices[][]|select(.name|test("\\[wt[AB]\\]$"))]|length')
+        ai-aligned-xcode reap --apply >/dev/null 2>&1
         left=$(/usr/bin/xcrun simctl list devices --json 2>/dev/null \
                | jq -r '[.devices[][]|select(.name|test("\\[wt[AB]\\]$"))]|length')
-        [ "${left:-0}" -eq 0 ] && ok "release restores every borrowed device name" \
-                               || no "release restores every borrowed device name" "$left still tagged"
+        [ "${left:-0}" -eq 0 ] && ok "release + reap leave no device tagged by the suite" \
+                               || no "release + reap leave no device tagged by the suite" \
+                                     "$left still tagged (borrowed after release: $borrowed_left)"
 
         /usr/bin/xcrun simctl delete "$SCRATCH" >/dev/null 2>&1
     else
