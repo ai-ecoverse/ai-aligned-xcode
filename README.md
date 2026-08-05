@@ -53,7 +53,10 @@ whole agent turn, so the workaround also burns context and cache.
    before your code ran" from "your code is wrong", and re-runs only the
    former. A genuine test or compile failure returns on the first attempt with
    its exit status intact.
-5. **Records every run** in SQLite, which is what makes (3) and (4) work.
+5. **Owns devices per worktree.** Each simulator belongs to one worktree, tagged
+   in its name; a device belonging to someone else is refused outright. Stops
+   the collision forming rather than serialising it.
+6. **Records every run** in SQLite, which is what makes (3), (4) and (5) work.
 
 Only simulator-bound work takes a lease. `generic/platform=…`, macOS and
 `-showBuildSettings` runs stay fully parallel, and read-only queries
@@ -102,6 +105,57 @@ what you are signing up for:
 the budget, and you get partial output plus a clear timeout status instead of a
 silent truncation.
 
+### Device ownership
+
+Leases stop two agents using one simulator *at the same time*. Ownership stops
+them wanting to in the first place.
+
+Each simulator belongs to exactly one worktree, recorded as a suffix on the
+device name — `iPhone 17 Pro [two-check-2]`. simctl has no metadata field, and
+the name is the only channel that survives a reboot, shows in Simulator.app, and
+is visible to agents that never call this tool. SQLite mirrors it; the name is
+the source of truth. Renaming is metadata-only, so tagging a device mid-build
+cannot disturb that build.
+
+- **First use claims.** An untagged device becomes yours when you first touch it.
+- **A foreign device is refused** — exit 78, naming the owner and the device you
+  should use instead.
+- **Supply**: a free stock device of the same type and runtime is assigned first;
+  only once that pool is exhausted is a new one cloned. `reap` deletes clones,
+  never devices it merely borrowed.
+
+```
+ai-aligned-xcode: refusing to use 719B8CBE-E6AC-4D6F-A9C9-B3B2A27D3ECD.
+
+  device : iPhone 17 Pro
+  owner  : worktree 'higher-upgrade'
+  you    : worktree 'two-check-2'
+  yours  : iPhone 17 Pro [two-check-2] = 4ADEDEA8-2E04-4392-B6D8-7EC5EA118BC4
+
+Re-run against your own device:
+  -destination 'platform=iOS Simulator,id=4ADEDEA8-2E04-4392-B6D8-7EC5EA118BC4'
+```
+
+This matters because **54% of observed destinations are a hardcoded UDID**, and
+**65% of the sessions using one never ran `simctl list`** — the UDID arrived by
+compaction summary, agent memory, or copy-paste. Filtering what `simctl list`
+shows would miss all of them; checking ownership when the destination resolves
+catches every one.
+
+Because ownership lives in the name, `simctl list` already reads as an ownership
+table. No output filtering is needed, and none is done — rewriting a read-only
+command that agents parse is not worth the reach it would add.
+
+Assignment renames devices you may also use by hand, so it is reversible:
+
+```bash
+ai-aligned-xcode devices          # who owns what
+ai-aligned-xcode release --apply  # untag borrowed devices, restore stock names
+ai-aligned-xcode reap --apply     # delete devices this tool cloned
+```
+
+Disable with `AI_ALIGNED_XCODE_NO_OWNERSHIP=true`.
+
 ### Failure classes
 
 `xcodebuild test` failed 31.9 % of the time in the observed corpus, and a
@@ -149,6 +203,7 @@ ai-aligned-xcode doctor    # environment check
 | `AI_ALIGNED_XCODE_LEASE_WAIT=<seconds>` | max lease wait (default `1800`) |
 | `AI_ALIGNED_XCODE_MIN_SAMPLES=<n>` | samples before the predictor is trusted (default `3`) |
 | `AI_ALIGNED_XCODE_NO_RETRY=true` | never retry infrastructure failures |
+| `AI_ALIGNED_XCODE_NO_OWNERSHIP=true` | skip the device-ownership check |
 | `AI_ALIGNED_XCODE_HOME=<dir>` | state directory (default `~/.ai-aligned-xcode`) |
 | `AI_ALIGNED_XCODE_DEBUG=true` | trace decisions to stderr |
 | `AMI_PASSTHROUGH=true` | force "not an agent" |

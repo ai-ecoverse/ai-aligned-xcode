@@ -776,6 +776,15 @@ SQL
         "ALTER TABLE runs ADD COLUMN failure_class TEXT;"
     /usr/bin/sqlite3 "$AAX_DB" >/dev/null 2>&1 \
         "ALTER TABLE runs ADD COLUMN retried INTEGER DEFAULT 0;"
+    /usr/bin/sqlite3 "$AAX_DB" >/dev/null 2>&1 <<'SQL'
+CREATE TABLE IF NOT EXISTS devices (
+  udid           TEXT PRIMARY KEY,
+  base_name      TEXT NOT NULL,
+  owner          TEXT NOT NULL,
+  created_by_aax INTEGER DEFAULT 0,
+  claimed_at     INTEGER
+);
+SQL
 }
 
 # ---------------------------------------------------------------- failure classes
@@ -953,6 +962,152 @@ aax_repo_root() {
 aax_worktree_slug() {
     local root="$1"
     printf '%s' "$root" | tr -d ' ' | cksum | cut -d' ' -f1
+}
+
+# ---------------------------------------------------------------- device ownership
+#
+# A device is owned by exactly one worktree, and ownership is written into the
+# device NAME as a "[label]" suffix. simctl offers no metadata field, and the
+# name is the only channel that survives a reboot, shows up in Simulator.app,
+# and is visible to anyone running `simctl list` — including agents that never
+# talk to this tool. SQLite mirrors it, but the name is the source of truth.
+#
+# Renaming is metadata-only: UDIDs are stable, so tagging a device a build is
+# already using cannot disturb that build.
+
+# Human-readable, stable identifier for the current worktree. The repo basename
+# is not enough: every intent workspace checks out to <workspace>/slicc, so all
+# of them would collide on "slicc".
+aax_worktree_label() {
+    local root="$1" label
+    case "$root" in
+        *"/.yolo/"*)              label="${root##*/.yolo/}" ;;
+        *"/.claude-worktrees/"*)  label="${root##*/.claude-worktrees/}" ;;
+        *"/intent/workspaces/"*)  label="${root##*/intent/workspaces/}" ;;
+        *)                        label="$(basename "$root")" ;;
+    esac
+    label="${label%%/*}"
+    # Keep it safe for a device name and for our own parsing.
+    label=$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-24)
+    printf '%s' "${label:-unknown}"
+}
+
+# Split "iPhone 17 Pro [two-check-2]" into base name and owner tag.
+aax_device_base() { printf '%s' "${1% \[*\]}"; }
+aax_device_tag() {
+    case "$1" in
+        *" ["*"]") local t="${1##* \[}"; printf '%s' "${t%\]}" ;;
+        *) printf '' ;;
+    esac
+}
+
+# Echo "name<TAB>state<TAB>deviceTypeIdentifier<TAB>runtimeKey" for a UDID.
+aax_device_info() {
+    AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json 2>/dev/null \
+      | jq -r --arg u "$1" '
+          .devices | to_entries[] | .key as $rt | .value[]
+          | select(.udid == $u)
+          | [.name, .state, .deviceTypeIdentifier, $rt] | @tsv' 2>/dev/null | head -1
+}
+
+# Rename a device to carry an owner tag, and remember it.
+aax_claim_device() {
+    local udid="$1" base="$2" label="$3" created="${4:-0}"
+    AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl rename "$udid" "$base [$label]" 2>/dev/null || return 1
+    aax_sql "INSERT OR REPLACE INTO devices(udid,base_name,owner,created_by_aax,claimed_at)
+             VALUES('${udid//\'/\'\'}','${base//\'/\'\'}','${label//\'/\'\'}',$created,$(date +%s));"
+    return 0
+}
+
+# Find (or make) this worktree's device of a given type+runtime. Echoes a UDID.
+# Assign a free stock device first; clone only once the pool is exhausted.
+aax_device_for() {
+    local dtype="$1" runtime="$2" label="$3" udid base
+
+    # Already ours?
+    udid=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json 2>/dev/null \
+      | jq -r --arg t "$dtype" --arg r "$runtime" --arg l " [$label]" '
+          .devices[$r][]? | select(.isAvailable and .deviceTypeIdentifier==$t
+                                   and (.name | endswith($l))) | .udid' 2>/dev/null | head -1)
+    [ -n "$udid" ] && { printf '%s' "$udid"; return 0; }
+
+    # A free, untagged one of the same type+runtime.
+    udid=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json 2>/dev/null \
+      | jq -r --arg t "$dtype" --arg r "$runtime" '
+          .devices[$r][]? | select(.isAvailable and .deviceTypeIdentifier==$t
+                                   and (.name | test("\\[[^]]+\\]$") | not)) | .udid' 2>/dev/null | head -1)
+    if [ -n "$udid" ]; then
+        base=$(aax_device_base "$(aax_device_info "$udid" | cut -f1)")
+        aax_claim_device "$udid" "$base" "$label" 0 && { printf '%s' "$udid"; return 0; }
+    fi
+
+    # Pool exhausted for this type+runtime: clone. `reap` cleans these up.
+    local src
+    src=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json 2>/dev/null \
+      | jq -r --arg t "$dtype" --arg r "$runtime" '
+          .devices[$r][]? | select(.isAvailable and .deviceTypeIdentifier==$t) | .udid' 2>/dev/null | head -1)
+    [ -z "$src" ] && return 1
+    base=$(aax_device_base "$(aax_device_info "$src" | cut -f1)")
+    udid=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl clone "$src" "$base [$label]" 2>/dev/null)
+    [ -z "$udid" ] && return 1
+    aax_sql "INSERT OR REPLACE INTO devices(udid,base_name,owner,created_by_aax,claimed_at)
+             VALUES('${udid//\'/\'\'}','${base//\'/\'\'}','${label//\'/\'\'}',1,$(date +%s));"
+    aax_notice "simulator pool exhausted for this device type; cloned $base [$label] = $udid"
+    printf '%s' "$udid"
+}
+
+# Enforce ownership for a resolved UDID. Returns non-zero (callers exit 78) and
+# prints guidance when the device belongs to another worktree.
+aax_check_ownership() {
+    local udid="$1" label="$2" info name tag base mine dtype runtime
+
+    [ "${AI_ALIGNED_XCODE_NO_OWNERSHIP:-false}" = "true" ] && return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    info=$(aax_device_info "$udid")
+    [ -z "$info" ] && return 0
+    name=$(printf '%s' "$info" | cut -f1)
+    dtype=$(printf '%s' "$info" | cut -f3)
+    runtime=$(printf '%s' "$info" | cut -f4)
+    tag=$(aax_device_tag "$name")
+    base=$(aax_device_base "$name")
+
+    # Ours already.
+    [ "$tag" = "$label" ] && return 0
+
+    # Unowned: claim it on first use. Without this, everyone keeps sharing the
+    # one device that got copied between sessions and ownership never forms.
+    if [ -z "$tag" ]; then
+        aax_claim_device "$udid" "$base" "$label" 0 \
+            && aax_notice "claimed $base ($udid) for worktree '$label'"
+        return 0
+    fi
+
+    # Owned by someone else. Work out what this worktree should use instead,
+    # so the refusal comes with an answer rather than just a No.
+    mine=$(aax_device_for "$dtype" "$runtime" "$label")
+    cat >&2 <<EOF
+ai-aligned-xcode: refusing to use $udid.
+
+  device : $base
+  owner  : worktree '$tag'
+  you    : worktree '$label'
+EOF
+    if [ -n "$mine" ]; then
+        # The assigned device's own name — not the denied device's. They differ
+        # whenever the pool hands over a different unit of the same type.
+        local mine_name; mine_name=$(aax_device_info "$mine" | cut -f1)
+        echo "  yours  : ${mine_name:-$base [$label]} = $mine" >&2
+        echo "" >&2
+        echo "Re-run against your own device:" >&2
+        echo "  -destination 'platform=iOS Simulator,id=$mine'" >&2
+    else
+        echo "" >&2
+        echo "No free device of this type could be assigned to you." >&2
+    fi
+    echo "" >&2
+    echo "Set AI_ALIGNED_XCODE_NO_OWNERSHIP=true to bypass this check." >&2
+    return 1
 }
 
 # ---------------------------------------------------------------- lock ordering
@@ -1228,6 +1383,15 @@ aax_shim_xcodebuild() {
     # instead of a rewrite notice followed by a refusal. The schema must exist
     # before the predictor queries it.
     aax_db_init
+
+    # (0) Ownership. Before anything expensive: a device belonging to another
+    # worktree is refused outright, with this worktree's equivalent named in
+    # the message. Catches the 65% of sessions that arrive with a UDID copied
+    # from memory or a compaction summary and never run `simctl list`.
+    if [ "$AAX_DEST_KIND" = "sim" ] && [ -n "$AAX_UDID" ]; then
+        aax_check_ownership "$AAX_UDID" "$(aax_worktree_label "$repo")" || exit 78
+    fi
+
     aax_check_budget "$gkey" xcodebuild "$@" || exit 78
 
     local -a argv=("$@")
@@ -1308,6 +1472,23 @@ aax_shim_xcrun() {
     fi
 
     local sub="$2" udid="$3"
+
+    # `simctl create <name> <type> <runtime>` — stamp the worktree into the
+    # name so a hand-made device is owned from birth. Rare (3 calls in the
+    # whole corpus) but it is the one place an agent names a device itself,
+    # and an untagged new device would otherwise be claimed by whoever
+    # touches it next.
+    if [ "$sub" = "create" ] && [ -n "$3" ]; then
+        local label; label=$(aax_worktree_label "$(aax_repo_root)")
+        case "$3" in
+            *" [$label]") ;;                       # already tagged
+            *"["*"]")     ;;                       # tagged for someone else: leave it, ownership will catch it
+            *) aax_notice "tagging new device as '$3 [$label]'"
+               set -- "$1" "$2" "$3 [$label]" "${@:4}" ;;
+        esac
+        exec "$real" "$@"
+    fi
+
     case "$AAX_SIMCTL_MUTATING" in
         *" $sub "*) ;;
         *) exec "$real" "$@" ;;
@@ -1322,6 +1503,11 @@ aax_shim_xcrun() {
     aax_db_init
     local agent repo start dur rc lease_file
     agent=$(aax_agent); repo=$(aax_repo_root)
+
+    # Same ownership rule as xcodebuild: booting, installing into or erasing
+    # another worktree's device is exactly the interference this prevents.
+    aax_check_ownership "$udid" "$(aax_worktree_label "$repo")" || exit 78
+
     mkdir -p "$AAX_LEASES" 2>/dev/null
     lease_file="$AAX_LEASES/$udid.lock"
 
@@ -1434,6 +1620,68 @@ SELECT COALESCE(NULLIF(failure_class,''),'(unclassified)') AS class,
  WHERE outcome <> 'ok'
  GROUP BY class ORDER BY n DESC;"
             ;;
+        devices)
+            aax_db_init
+            local me; me=$(aax_worktree_label "$(aax_repo_root)")
+            echo "worktree: $me"
+            echo
+            AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json 2>/dev/null \
+              | jq -r --arg me "$me" '
+                  .devices | to_entries[] | .key as $rt | .value[]
+                  | select(.isAvailable)
+                  | (.name | capture("^(?<b>.*) \\[(?<o>[^]]+)\\]$") // {b:.name, o:""}) as $n
+                  | [ (if $n.o == "" then "-" elif $n.o == $me then "MINE" else $n.o end),
+                      $n.b, .udid, .state,
+                      ($rt | sub("com.apple.CoreSimulator.SimRuntime.";"")) ]
+                  | @tsv' 2>/dev/null \
+              | sort | awk -F'\t' 'BEGIN{printf "%-16s %-26s %-38s %-9s %s\n","OWNER","DEVICE","UDID","STATE","RUNTIME"}
+                                   {printf "%-16s %-26s %-38s %-9s %s\n",$1,$2,$3,$4,$5}'
+            ;;
+        release)
+            # Undo ownership on devices we only borrowed, restoring the stock
+            # name. Assignment renames real devices the user may also use by
+            # hand, so this has to be a one-liner to reverse.
+            aax_db_init
+            echo "stock devices to untag (cloned ones are left to 'reap'):"
+            local rn=0
+            while IFS='|' read -r u b; do
+                [ -z "$u" ] && continue
+                echo "  $u -> \"$b\""
+                # $1 is still the subcommand here; the flag is $2.
+                if [ "${2:-}" = "--apply" ]; then
+                    AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl rename "$u" "$b" 2>/dev/null \
+                        && aax_sql "DELETE FROM devices WHERE udid='${u//\'/\'\'}';" \
+                        && echo "    restored"
+                fi
+                rn=$((rn+1))
+            done <<EOF
+$(aax_sql "SELECT udid||'|'||base_name FROM devices WHERE created_by_aax=0;")
+EOF
+            [ "$rn" -eq 0 ] && echo "  (none)"
+            [ "${2:-}" != "--apply" ] && [ "$rn" -gt 0 ] && echo "  (dry run — pass --apply to restore)"
+            ;;
+        reap)
+            aax_db_init
+            echo "cloned devices whose worktree no longer exists:"
+            local n=0
+            while IFS='|' read -r u b o; do
+                [ -z "$u" ] && continue
+                # Only ever delete devices this tool created. A stock device
+                # that was merely assigned gets untagged, never removed.
+                echo "  $b [$o]  $u"
+                if [ "${1:-}" = "--apply" ] || [ "${2:-}" = "--apply" ]; then
+                    AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl delete "$u" >/dev/null 2>&1 \
+                        && aax_sql "DELETE FROM devices WHERE udid='${u//\'/\'\'}';" \
+                        && echo "    deleted"
+                fi
+                n=$((n+1))
+            done <<EOF
+$(aax_sql "SELECT udid||'|'||base_name||'|'||owner FROM devices WHERE created_by_aax=1;")
+EOF
+            [ "$n" -eq 0 ] && echo "  (none)"
+            [ "${1:-}" != "--apply" ] && [ "${2:-}" != "--apply" ] && [ "$n" -gt 0 ] \
+                && echo "  (dry run — pass --apply to delete)"
+            ;;
         leases)
             echo "held simulator leases:"
             for f in "$AAX_LEASES"/*.lock; do
@@ -1472,7 +1720,10 @@ xcrun, swift and xcodegen earlier on PATH; there is nothing to teach the agent.
 
   ai-aligned-xcode stats     per-key runtime history feeding the predictor
   ai-aligned-xcode failures  failure classes, and which were infrastructure
+  ai-aligned-xcode devices   simulator ownership, by worktree
   ai-aligned-xcode leases    which simulators are currently leased
+  ai-aligned-xcode release   untag borrowed stock devices, restoring names (--apply)
+  ai-aligned-xcode reap      delete cloned devices for dead worktrees (--apply)
   ai-aligned-xcode doctor    environment check
   ai-aligned-xcode version
 
@@ -1481,6 +1732,7 @@ Environment:
   AI_ALIGNED_XCODE_DISABLE=true      pass everything through untouched
   AI_ALIGNED_XCODE_BUDGET=<seconds>  gate threshold (default 300)
   AI_ALIGNED_XCODE_NO_RETRY=true     never retry infrastructure failures
+  AI_ALIGNED_XCODE_NO_OWNERSHIP=true skip the device-ownership check
   AI_ALIGNED_XCODE_DEBUG=true        trace decisions to stderr
 EOF
             ;;

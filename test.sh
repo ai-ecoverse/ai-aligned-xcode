@@ -352,6 +352,71 @@ out="$(ai-aligned-xcode failures 2>&1)"
 case "$out" in *test_failure*your\ code*) ok "failures separates infrastructure from your code" ;;
                *) no "failures separates infrastructure from your code" "$out" ;; esac
 
+# --------------------------------------------------------------- device ownership
+#
+# Uses a purpose-made scratch device and restores every real device it touches.
+# Assignment renames devices from the real pool, so the teardown matters.
+
+if has_xcode && command -v jq >/dev/null 2>&1; then
+    mkdir -p "$TMP/wtA" "$TMP/wtB"
+    ( cd "$TMP/wtA" && git init -q . ) 2>/dev/null
+    ( cd "$TMP/wtB" && git init -q . ) 2>/dev/null
+
+    SCRATCH=$(/usr/bin/xcrun simctl create "aax-suite-scratch" \
+        com.apple.CoreSimulator.SimDeviceType.iPhone-16 \
+        com.apple.CoreSimulator.SimRuntime.iOS-18-5 2>/dev/null)
+
+    if [ -n "$SCRATCH" ]; then
+        label_a="$( cd "$TMP/wtA" && ai-aligned-xcode devices 2>/dev/null | head -1 )"
+        case "$label_a" in *wtA*) ok "worktree label derives from the checkout" ;;
+                           *) no "worktree label derives from the checkout" "$label_a" ;; esac
+
+        # First use by wtA claims the untagged device.
+        ( cd "$TMP/wtA" && xcrun simctl boot "$SCRATCH" ) >/dev/null 2>"$TMP/own1.err"
+        grep -q "claimed" "$TMP/own1.err" && ok "claims an untagged device on first use" \
+                                          || no "claims an untagged device on first use" "$(head -1 "$TMP/own1.err")"
+        nm=$(/usr/bin/xcrun simctl list devices --json 2>/dev/null \
+             | jq -r --arg u "$SCRATCH" '.devices[][]|select(.udid==$u)|.name')
+        case "$nm" in *"[wtA]") ok "ownership is written into the device name ($nm)" ;;
+                      *) no "ownership is written into the device name" "$nm" ;; esac
+
+        # wtB must be refused, and told what to use instead.
+        ( cd "$TMP/wtB" && xcrun simctl boot "$SCRATCH" ) >/dev/null 2>"$TMP/own2.err"
+        rc=$?
+        [ "$rc" -eq 78 ] && ok "denies a device owned by another worktree (exit 78)" \
+                         || no "denies a device owned by another worktree" "rc=$rc"
+        grep -q "owner  : worktree 'wtA'" "$TMP/own2.err" \
+            && ok "names the owning worktree" \
+            || no "names the owning worktree" "$(head -3 "$TMP/own2.err" | tr '\n' ' ')"
+        # The suggested device must really carry that name.
+        sug=$(grep -oE 'yours  : .* = [0-9A-F-]{36}' "$TMP/own2.err" | grep -oE '[0-9A-F-]{36}$')
+        sugname=$(grep -oE 'yours  : .*=' "$TMP/own2.err" | sed 's/yours  : //; s/ =$//')
+        realname=$(/usr/bin/xcrun simctl list devices --json 2>/dev/null \
+                   | jq -r --arg u "$sug" '.devices[][]|select(.udid==$u)|.name')
+        [ -n "$sug" ] && [ "$sugname" = "$realname" ] \
+            && ok "suggests a device that exists under that name" \
+            || no "suggests a device that exists under that name" "said '$sugname', actually '$realname'"
+
+        # Bypass must work.
+        ( cd "$TMP/wtB" && AI_ALIGNED_XCODE_NO_OWNERSHIP=true xcrun simctl shutdown "$SCRATCH" ) >/dev/null 2>&1
+        [ $? -ne 78 ] && ok "NO_OWNERSHIP bypasses the check" \
+                      || no "NO_OWNERSHIP bypasses the check" "still denied"
+
+        # release must restore every borrowed stock device.
+        ai-aligned-xcode release --apply >/dev/null 2>&1
+        left=$(/usr/bin/xcrun simctl list devices --json 2>/dev/null \
+               | jq -r '[.devices[][]|select(.name|test("\\[wt[AB]\\]$"))]|length')
+        [ "${left:-0}" -eq 0 ] && ok "release restores every borrowed device name" \
+                               || no "release restores every borrowed device name" "$left still tagged"
+
+        /usr/bin/xcrun simctl delete "$SCRATCH" >/dev/null 2>&1
+    else
+        skip "device ownership" "could not create a scratch simulator"
+    fi
+else
+    skip "device ownership" "no Xcode or no jq"
+fi
+
 # --------------------------------------------------------------- summary
 
 echo
