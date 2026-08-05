@@ -343,6 +343,11 @@ cls="$(sql "SELECT failure_class FROM runs WHERE outcome='ok' AND retried=1 LIMI
     && ok "records which class was recovered ($cls)" \
     || no "records which class was recovered" "got '$cls'"
 
+# A lease_timeout must not record the epoch as a duration.
+bad="$(sql "SELECT COUNT(*) FROM runs WHERE duration_ms > 86400000;")"
+[ "${bad:-0}" -eq 0 ] && ok "no absurd durations recorded" \
+                      || no "no absurd durations recorded" "$bad row(s) over 24h — unset start timestamp?"
+
 out="$(ai-aligned-xcode failures 2>&1)"
 case "$out" in *test_failure*your\ code*) ok "failures separates infrastructure from your code" ;;
                *) no "failures separates infrastructure from your code" "$out" ;; esac

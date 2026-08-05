@@ -1265,6 +1265,10 @@ aax_shim_xcodebuild() {
 
     if [ "$AAX_LEASE_FAILED" = "1" ]; then
         outcome="lease_timeout"; rc=75
+        # Nothing ran, so there is no run to time. Without this, `start` stays
+        # unset and `end - start` records the epoch as a duration, which reads
+        # as a 56-year build in `stats`.
+        start=$(date +%s000)
     else
         start=$(date +%s000)     # time the run, not the wait
         aax_attempt "$budget" "$real" "${argv[@]}"
