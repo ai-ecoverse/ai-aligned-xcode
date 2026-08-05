@@ -151,10 +151,36 @@ Assignment renames devices you may also use by hand, so it is reversible:
 ```bash
 ai-aligned-xcode devices          # who owns what
 ai-aligned-xcode release --apply  # untag borrowed devices, restore stock names
-ai-aligned-xcode reap --apply     # delete devices this tool cloned
+ai-aligned-xcode reap --apply     # delete devices this tool created
+ai-aligned-xcode reap --older-than 3d --apply   # ...or anything idle that long
 ```
 
 Disable with `AI_ALIGNED_XCODE_NO_OWNERSHIP=true`.
+
+### Reaping idle devices
+
+Simulators are not cheap once they have been booted: on one real machine 17
+active devices held 39.8 GB while 28 never-booted ones cost 0.5 GB between them.
+Disk follows use, not existence.
+
+```bash
+ai-aligned-xcode reap --older-than 3d          # dry run, with sizes and UDIDs
+ai-aligned-xcode reap --older-than 3d --apply  # delete them
+```
+
+Three things are never proposed, whatever the age:
+
+- **Booted devices** — something is using them by definition.
+- **Devices with a held lease** — a build is between phases.
+- **Devices named by a running `xcodebuild`/`xctest`** — belt and braces for a
+  run that has not taken a lease.
+
+Never-used devices are also skipped by default. They cost ~20 MB each and are
+the pool assignment draws from, so deleting them just forces a `simctl create`
+for the next worktree. `--include-never-used` overrides that.
+
+Without `--older-than`, `reap` falls back to devices this tool created itself.
+It never deletes a device it merely borrowed — that is `release`'s job.
 
 ### Failure classes
 

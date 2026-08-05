@@ -423,6 +423,60 @@ else
     skip "device ownership" "no Xcode or no jq"
 fi
 
+# --------------------------------------------------------------- reap --older-than
+
+out="$(ai-aligned-xcode reap --older-than bogus 2>&1)"
+case "$out" in *"cannot parse duration"*) ok "reap rejects a bad duration" ;;
+               *) no "reap rejects a bad duration" "$out" ;; esac
+
+out="$(ai-aligned-xcode reap --older-than 3d 2>&1 | head -1)"
+case "$out" in *"not used in the last 3d"*) ok "reap --older-than selects by age" ;;
+               *) no "reap --older-than selects by age" "$out" ;; esac
+
+# Dry run must never delete.
+if has_xcode && command -v jq >/dev/null 2>&1; then
+    n_before=$(/usr/bin/xcrun simctl list devices --json 2>/dev/null | jq -r '[.devices[][]]|length')
+    ai-aligned-xcode reap --older-than 1s >/dev/null 2>&1
+    n_after=$(/usr/bin/xcrun simctl list devices --json 2>/dev/null | jq -r '[.devices[][]]|length')
+    [ "$n_before" = "$n_after" ] && ok "reap without --apply deletes nothing ($n_before devices)" \
+                                 || no "reap without --apply deletes nothing" "$n_before -> $n_after"
+
+    # A booted device must never be a candidate.
+    booted=$(/usr/bin/xcrun simctl list devices --json 2>/dev/null \
+             | jq -r '[.devices[][]|select(.state=="Booted")][0].udid // empty')
+    if [ -n "$booted" ]; then
+        ai-aligned-xcode reap --older-than 1s 2>&1 | grep -q "$booted" \
+            && no "reap never proposes a booted device" "$booted was listed" \
+            || ok "reap never proposes a booted device"
+    else
+        skip "booted-device guard" "nothing booted right now"
+    fi
+
+    # A held lease must veto the candidate.
+    cand=$(/usr/bin/xcrun simctl list devices --json 2>/dev/null \
+           | jq -r '[.devices[][]|select(.isAvailable and .state=="Shutdown" and .lastUsedAt)][0].udid // empty')
+    if [ -n "$cand" ]; then
+        mkdir -p "$AI_ALIGNED_XCODE_HOME/leases"
+        ( exec 9>>"$AI_ALIGNED_XCODE_HOME/leases/$cand.lock"
+          python3 -c 'import fcntl,sys; fcntl.flock(9, fcntl.LOCK_EX)' && sleep 6
+          exec 9>&- ) &
+        rh=$!
+        sleep 1
+        ai-aligned-xcode reap --older-than 1s >"$TMP/reap.out" 2>&1
+        if grep -q "lease currently held" "$TMP/reap.out" && grep -q "$cand" "$TMP/reap.out"; then
+            ok "reap skips a device whose lease is held"
+        else
+            no "reap skips a device whose lease is held" \
+               "cand=$cand; lines: $(grep -c . "$TMP/reap.out") ; $(grep "$cand" "$TMP/reap.out" | head -1)"
+        fi
+        wait "$rh" 2>/dev/null
+    else
+        skip "lease guard on reap" "no shutdown+used device available"
+    fi
+else
+    skip "reap --older-than behaviour" "no Xcode or no jq"
+fi
+
 # --------------------------------------------------------------- summary
 
 echo

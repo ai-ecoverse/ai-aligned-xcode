@@ -1146,6 +1146,33 @@ aax_dd_lock_file() {
     printf '%s/dd-%s.lock' "$AAX_LEASES" "$h"
 }
 
+# "3d" / "12h" / "90m" / "45s" / bare seconds -> seconds. Non-zero on garbage.
+aax_duration_seconds() {
+    local v="$1" n u
+    n="${v%[dhms]}"; u="${v#"$n"}"
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    case "$u" in
+        d) echo $((n * 86400)) ;;
+        h) echo $((n * 3600)) ;;
+        m) echo $((n * 60)) ;;
+        s|'') echo "$n" ;;
+        *) return 1 ;;
+    esac
+}
+
+# True when <lockfile> exists and someone holds it.
+aax_lease_held() {
+    [ -e "$1" ] || return 1
+    python3 -c '
+import fcntl, sys
+try:
+    fcntl.flock(open(sys.argv[1], "a"), fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(0)   # held by someone else
+sys.exit(1)       # free
+' "$1" 2>/dev/null
+}
+
 AAX_LEASE_FAILED=0
 AAX_LEASE_WAIT_MS=0
 
@@ -1681,38 +1708,116 @@ EOF
             ;;
         reap)
             aax_db_init
-            echo "cloned devices whose worktree no longer exists:"
-            local n=0
-            while IFS='|' read -r u b o; do
+            shift
+            local apply=0 older="" include_never=0 arg
+            while [ $# -gt 0 ]; do
+                arg="$1"
+                case "$arg" in
+                    --apply)              apply=1 ;;
+                    --older-than)         older="$2"; shift ;;
+                    --older-than=*)       older="${arg#*=}" ;;
+                    --include-never-used) include_never=1 ;;
+                    *) echo "reap: unknown option '$arg'" >&2; return 1 ;;
+                esac
+                shift
+            done
+
+            local cutoff=0
+            if [ -n "$older" ]; then
+                cutoff=$(aax_duration_seconds "$older") \
+                    || { echo "reap: cannot parse duration '$older' (try 3d, 12h, 90m)" >&2; return 1; }
+            fi
+
+            # Candidate selection lives in python: it needs the device JSON,
+            # lastUsedAt arithmetic and byte sizes in one pass.
+            local cands
+            cands=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json 2>/dev/null \
+              | AAX_CUTOFF="$cutoff" AAX_NEVER="$include_never" AAX_MINE="$(aax_sql \
+                    "SELECT group_concat(udid,' ') FROM devices WHERE created_by_aax=1;")" python3 -c '
+import json, os, sys, time
+from datetime import datetime, timezone
+
+cutoff = int(os.environ["AAX_CUTOFF"])
+want_never = os.environ["AAX_NEVER"] == "1"
+mine = set((os.environ.get("AAX_MINE") or "").split())
+now = time.time()
+
+for rt, devs in json.load(sys.stdin)["devices"].items():
+    for d in devs:
+        if not d.get("isAvailable"):
+            continue
+        # A booted device is in use by definition. Never a candidate.
+        if d.get("state") == "Booted":
+            continue
+        last, age = d.get("lastUsedAt"), None
+        if last:
+            t = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc).timestamp()
+            age = (now - t) / 86400.0
+        if cutoff:
+            if last is None:
+                # Never-used devices are pristine stock at ~20MB. They are the
+                # supply that assignment draws from, not waste; deleting them
+                # forces a create for every new worktree. Opt in explicitly.
+                if not want_never:
+                    continue
+            elif (now - t) < cutoff:
+                continue
+        elif d["udid"] not in mine:
+            # No age filter: fall back to "devices this tool created".
+            continue
+        print("\t".join([d["udid"], d["name"], str(d.get("dataPathSize") or 0),
+                         ("%.1f" % age) if age is not None else "never"]))
+' 2>/dev/null)
+
+            if [ -n "$older" ]; then
+                echo "devices not used in the last $older:"
+            else
+                echo "devices this tool created:"
+            fi
+
+            local n=0 freed=0 u nm sz age skipped=0
+            while IFS=$'\t' read -r u nm sz age; do
                 [ -z "$u" ] && continue
-                # Only ever delete devices this tool created. A stock device
-                # that was merely assigned gets untagged, never removed.
-                echo "  $b [$o]  $u"
-                if [ "${1:-}" = "--apply" ] || [ "${2:-}" = "--apply" ]; then
-                    AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl delete "$u" >/dev/null 2>&1 \
-                        && aax_sql "DELETE FROM devices WHERE udid='${u//\'/\'\'}';" \
-                        && echo "    deleted"
+                # Two live-use guards the JSON cannot answer.
+                if aax_lease_held "$AAX_LEASES/$u.lock"; then
+                    echo "  skip  $nm ($u) — lease currently held"
+                    skipped=$((skipped + 1)); continue
                 fi
-                n=$((n+1))
-            done <<EOF
-$(aax_sql "SELECT udid||'|'||base_name||'|'||owner FROM devices WHERE created_by_aax=1;")
-EOF
+                if pgrep -fl 'xcodebuild|xctest' 2>/dev/null | grep -q "$u"; then
+                    echo "  skip  $nm ($u) — a running build references it"
+                    skipped=$((skipped + 1)); continue
+                fi
+                printf '  %-30s %6.2f GB  %-12s %s\n' "${nm:0:30}" \
+                    "$(echo "$sz" | awk '{print $1/1073741824}')" \
+                    "$([ "$age" = "never" ] && echo never || echo "${age}d ago")" "$u"
+                n=$((n + 1)); freed=$((freed + sz))
+                if [ "$apply" = "1" ]; then
+                    if AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl delete "$u" >/dev/null 2>&1; then
+                        aax_sql "DELETE FROM devices WHERE udid='${u//\'/\'\'}';"
+                        rm -f "$AAX_LEASES/$u.lock"
+                        echo "        deleted"
+                    else
+                        echo "        DELETE FAILED"
+                    fi
+                fi
+            done <<< "$cands"
+
             [ "$n" -eq 0 ] && echo "  (none)"
-            [ "${1:-}" != "--apply" ] && [ "${2:-}" != "--apply" ] && [ "$n" -gt 0 ] \
-                && echo "  (dry run — pass --apply to delete)"
+            [ "$skipped" -gt 0 ] && echo "  ($skipped skipped as in use)"
+            if [ "$n" -gt 0 ]; then
+                echo "  ---"
+                printf '  %d device(s), %.2f GB%s\n' "$n" \
+                    "$(echo "$freed" | awk '{print $1/1073741824}')" \
+                    "$([ "$apply" = "1" ] && echo ' freed' || echo ' would be freed')"
+                [ "$apply" = "1" ] || echo "  (dry run — pass --apply to delete)"
+            fi
             ;;
         leases)
             echo "held simulator leases:"
             for f in "$AAX_LEASES"/*.lock; do
                 [ -e "$f" ] || { echo "  (none)"; break; }
-                if python3 -c '
-import fcntl, sys
-f = open(sys.argv[1], "a")
-try:
-    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except OSError:
-    sys.exit(1)
-' "$f" 2>/dev/null; then
+                if ! aax_lease_held "$f"; then
                     echo "  $(basename "$f" .lock)  free"
                 else
                     echo "  $(basename "$f" .lock)  HELD"
@@ -1742,7 +1847,9 @@ xcrun, swift and xcodegen earlier on PATH; there is nothing to teach the agent.
   ai-aligned-xcode devices   simulator ownership, by worktree
   ai-aligned-xcode leases    which simulators are currently leased
   ai-aligned-xcode release   untag borrowed stock devices, restoring names (--apply)
-  ai-aligned-xcode reap      delete cloned devices for dead worktrees (--apply)
+  ai-aligned-xcode reap      delete devices this tool created (--apply)
+    reap --older-than 3d       ...or any device unused for that long
+    reap --include-never-used  ...also never-booted stock devices (rarely wanted)
   ai-aligned-xcode doctor    environment check
   ai-aligned-xcode version
 
