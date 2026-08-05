@@ -979,14 +979,43 @@ aax_dd_lock_file() {
 AAX_LEASE_FAILED=0
 AAX_LEASE_WAIT_MS=0
 
+# flock(2) on an already-open fd. <timeout> 0 means try-once, non-blocking.
+#
+# NOT lockf(1): macOS lockf BUSY-WAITS, burning a full core for the whole wait,
+# with or without -t. Fourteen waiters took this machine to 0.18% idle. Python's
+# fcntl.flock is a real blocking lock — measured at 0.02s of CPU for a 9.5s
+# wait — and SIGALRM gives the timeout without polling.
+aax_flock() {
+    local fd="$1" timeout="$2"
+    python3 -c '
+import fcntl, signal, sys
+fd, timeout = int(sys.argv[1]), float(sys.argv[2])
+if timeout <= 0:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(1)
+    sys.exit(0)
+def expire(_sig, _frm):
+    sys.exit(1)
+signal.signal(signal.SIGALRM, expire)
+signal.setitimer(signal.ITIMER_REAL, timeout)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+except (OSError, InterruptedError):
+    sys.exit(1)
+signal.setitimer(signal.ITIMER_REAL, 0)
+' "$fd" "$timeout" 2>/dev/null
+}
+
 # Acquire a lease on <fd> over <file>, blocking in this process.
 #
-# The lock is held by THIS shell: lockf(1) exits immediately, but the flock(2)
-# lives on the open file description, which our fd keeps alive until we close
-# it. Holding it here (rather than re-exec'ing under `lockf <file> <cmd>`) keeps
-# the watchdog and the timing in the same process, and means the agent's single
-# tool call absorbs the wait. Returning "busy, retry later" instead is what
-# produced the poll loops this tool exists to remove.
+# The lock is held by THIS shell: the helper exits immediately once acquired,
+# but the flock(2) lives on the open file description, which our fd keeps alive
+# until we close it. Holding it here (rather than re-exec'ing the payload under
+# a locking wrapper) keeps the watchdog and the timing in the same process, and
+# means the agent's single tool call absorbs the wait. Returning "busy, retry
+# later" instead is what produced the poll loops this tool exists to remove.
 aax_take_lease() {
     local fd="$1" file="$2" busy_msg="$3" t0
 
@@ -997,11 +1026,11 @@ aax_take_lease() {
         *) return 1 ;;
     esac
 
-    /usr/bin/lockf -s -t 0 "$fd" && return 0
+    aax_flock "$fd" 0 && return 0
 
     aax_notice "$busy_msg; waiting (up to ${AAX_LEASE_WAIT}s)"
     t0=$(date +%s)
-    if ! /usr/bin/lockf -s -t "$AAX_LEASE_WAIT" "$fd"; then
+    if ! aax_flock "$fd" "$AAX_LEASE_WAIT"; then
         aax_notice "gave up waiting after ${AAX_LEASE_WAIT}s"
         AAX_LEASE_FAILED=1
     fi
@@ -1294,8 +1323,15 @@ aax_shim_xcrun() {
 
     export AI_ALIGNED_XCODE_ACTIVE=1
     start=$(date +%s000)
-    /usr/bin/lockf -k -t "$AAX_LEASE_WAIT" "$lease_file" "$real" "$@"
+    AAX_LEASE_FAILED=0
+    aax_take_lease 9 "$lease_file" "simulator $udid is leased by another run"
+    if [ "$AAX_LEASE_FAILED" = "1" ]; then
+        exec 9>&- 2>/dev/null
+        exit 75
+    fi
+    "$real" "$@" 9>&-
     rc=$?
+    exec 9>&- 2>/dev/null
     dur=$(( $(date +%s000) - start ))
 
     aax_record "$agent" "$(basename "$repo")" "$(aax_worktree_slug "$repo")" \
@@ -1398,7 +1434,14 @@ SELECT COALESCE(NULLIF(failure_class,''),'(unclassified)') AS class,
             echo "held simulator leases:"
             for f in "$AAX_LEASES"/*.lock; do
                 [ -e "$f" ] || { echo "  (none)"; break; }
-                if /usr/bin/lockf -k -s -t 0 "$f" true 2>/dev/null; then
+                if python3 -c '
+import fcntl, sys
+f = open(sys.argv[1], "a")
+try:
+    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)
+' "$f" 2>/dev/null; then
                     echo "  $(basename "$f" .lock)  free"
                 else
                     echo "  $(basename "$f" .lock)  HELD"
@@ -1410,7 +1453,7 @@ SELECT COALESCE(NULLIF(failure_class,''),'(unclassified)') AS class,
             echo "  state dir     : $AAX_HOME"
             echo "  detected as   : $(aax_agent)"
             echo "  real xcodebuild: $(aax_real_tool xcodebuild)"
-            echo "  lockf         : $([ -x /usr/bin/lockf ] && echo ok || echo MISSING)"
+            echo "  python3       : $(command -v python3 >/dev/null && echo "ok ($(python3 -c 'import fcntl; print("fcntl available")' 2>/dev/null || echo 'NO fcntl'))" || echo 'MISSING (leases will not work)')"
             echo "  sqlite3       : $(/usr/bin/sqlite3 --version 2>/dev/null | cut -d' ' -f1)"
             echo "  jq            : $(command -v jq >/dev/null && echo ok || echo 'missing (name= destinations will not resolve)')"
             echo "  runs recorded : $(aax_sql 'SELECT COUNT(*) FROM runs;' 2>/dev/null || echo 0)"

@@ -41,8 +41,62 @@ if [ "$(uname -s)" != "Darwin" ]; then
     echo "0 passed, 0 failed"; exit 0
 fi
 
-[ -x /usr/bin/lockf ]   && ok "lockf(1) present"   || no "lockf(1) present" "required for leases"
+python3 -c 'import fcntl' 2>/dev/null && ok "python3 + fcntl present" \
+                                      || no "python3 + fcntl present" "required for leases"
 [ -x /usr/bin/sqlite3 ] && ok "sqlite3 present"    || no "sqlite3 present"  "required for the predictor"
+
+# --------------------------------------------------------------- lease is CHEAP
+#
+# THE regression test. macOS lockf(1) busy-waits — with or without -t — so the
+# original lease implementation burned a full core per waiter and took a real
+# machine to 0.18% idle with fourteen of them. The suite passed anyway, because
+# every test asserted that waiting WORKED and none asserted what it COST.
+# A blocking flock should use approximately no CPU while it waits.
+
+LOCKF_SPINS=""
+if [ -x /usr/bin/lockf ]; then
+    rm -f "$TMP/spin.probe"
+    ( exec 9>>"$TMP/spin.probe"; /usr/bin/lockf -s -t 0 9 && sleep 4; exec 9>&- ) &
+    sp_holder=$!
+    sleep 0.4
+    ( exec 8>>"$TMP/spin.probe"; /usr/bin/lockf -s -t 3 8 ) & sp_waiter=$!
+    sleep 2
+    sp_cpu=$(ps -o time= -p "$(pgrep -x lockf | head -1)" 2>/dev/null | tr -d ' ')
+    case "$sp_cpu" in 0:00.0*|"") LOCKF_SPINS=no ;; *) LOCKF_SPINS=yes ;; esac
+    wait "$sp_waiter" "$sp_holder" 2>/dev/null
+    rm -f "$TMP/spin.probe"
+    [ "$LOCKF_SPINS" = "yes" ] \
+        && ok "confirmed lockf(1) busy-waits on this OS (so we must not use it)" \
+        || skip "lockf spin check" "lockf did not spin here; the flock test below still governs"
+fi
+
+# Our own lease: a waiter must block, not spin.
+rm -f "$TMP/cheap.lock"
+( exec 9>>"$TMP/cheap.lock"
+  python3 -c 'import fcntl,sys; fcntl.flock(9, fcntl.LOCK_EX)' && sleep 5
+  exec 9>&- ) &
+cheap_holder=$!
+sleep 0.4
+( exec 8>>"$TMP/cheap.lock"
+  python3 -c '
+import fcntl, signal, sys, os, time
+def expire(*_): sys.exit(1)
+signal.signal(signal.SIGALRM, expire); signal.setitimer(signal.ITIMER_REAL, 20)
+t0 = time.time()
+fcntl.flock(8, fcntl.LOCK_EX)
+cpu = time.process_time()
+print(f"{time.time()-t0:.1f} {cpu:.3f}")
+' ) > "$TMP/cheap.out" 2>/dev/null &
+cheap_waiter=$!
+wait "$cheap_waiter" "$cheap_holder" 2>/dev/null
+read -r waited cpu < "$TMP/cheap.out" 2>/dev/null || { waited=0; cpu=99; }
+# Waited seconds of wall clock; CPU must stay negligible.
+if awk -v w="$waited" -v c="$cpu" 'BEGIN{exit !(w>3 && c<0.5)}' 2>/dev/null; then
+    ok "a waiting lease blocks instead of spinning (${waited}s wall, ${cpu}s CPU)"
+else
+    no "a waiting lease blocks instead of spinning" "waited=${waited}s cpu=${cpu}s — a spin-wait would show cpu≈wall"
+fi
+rm -f "$TMP/cheap.lock" "$TMP/cheap.out"
 
 # --------------------------------------------------------------- plumbing
 
@@ -51,8 +105,8 @@ case "$out" in ai-aligned-xcode\ *) ok "version reports itself" ;;
                *) no "version reports itself" "$out" ;; esac
 
 out="$(ai-aligned-xcode doctor 2>&1)"
-case "$out" in *"lockf         : ok"*) ok "doctor sees lockf" ;;
-               *) no "doctor sees lockf" "$out" ;; esac
+case "$out" in *"python3       : ok"*) ok "doctor sees python3 + fcntl" ;;
+               *) no "doctor sees python3 + fcntl" "$out" ;; esac
 
 # The pragma-echo regression: any sqlite chatter would corrupt tool output.
 if has_xcode; then
