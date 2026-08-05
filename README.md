@@ -28,6 +28,8 @@ Factory Droid, Auggie, Intent) on one machine:
 | Spin-wait `sleep`s | 141 |
 | `pkill` commands that killed *another agent's* build | 15 |
 | `xcodebuild test` error rate | 31.9 % |
+| Destinations that are a hardcoded UDID | 54 % |
+| Sessions using one that never ran `simctl list` | 65 % |
 
 Agents already know they are colliding. Lacking a lease, they hand-roll mutexes
 out of `pgrep`, `sleep` and — when patience runs out — `pkill`. Every poll is a
@@ -246,11 +248,25 @@ simulator (fd 9)**. `xcodegen` takes only fd 8, `xcrun simctl` only fd 9, and
 `xcodebuild` takes 8 then 9, so no cycle can form. A test asserts a run needing
 both completes rather than hanging to the lease timeout.
 
-Locking uses **`/usr/bin/lockf`**, since macOS ships no `flock(1)`. The lock is
-held on a file descriptor by the shim process itself, so `lockf(1)` can exit
-while the `flock(2)` lives on the still-open file description. Child processes
-get the descriptor closed (`9>&-`) — otherwise the watchdog, which outlives the
-build by a grace period, would pin the lease after the build had finished.
+Locking is `fcntl.flock` via `python3`. macOS ships no `flock(1)`, and its
+`lockf(1)` — the obvious substitute — **busy-waits**, with or without `-t`,
+despite the man page's "waits indefinitely to acquire the lock":
+
+```
+lockf -s -t 10 <fd>   ->  3.03s CPU for 3s of waiting
+lockf -s     <fd>     ->  97.5% CPU
+python3 fcntl.flock   ->  0.02s CPU for 9.5s of waiting
+```
+
+An early build used `lockf` and put fourteen waiters on one lease, taking a real
+machine to 0.18 % idle at load average 318 — a lease system built to stop agents
+spinning that was itself a distributed spin lock. Do not reach for `lockf` here.
+
+The lock is held on a file descriptor by the shim process itself, so the helper
+can exit while the `flock(2)` lives on the still-open file description. Child
+processes get the descriptor closed (`8>&- 9>&-`) — otherwise the watchdog,
+which outlives the build by a grace period, would pin the lease after the build
+had finished.
 
 `timeout(1)` is also absent from base macOS, so the budget watchdog is
 hand-rolled rather than depending on GNU coreutils being installed.
@@ -284,9 +300,15 @@ management nor build execution.
 
 ## Requirements
 
-macOS with Xcode. `jq` is optional but needed to resolve `-destination
-'…,name=iPhone 17 Pro'` to a concrete UDID; without it, name-based destinations
-run unleased.
+macOS with Xcode. Everything else is in the base system:
+
+| | used for | if missing |
+| --- | --- | --- |
+| `python3` + `fcntl` | leases, `flock(2)` without spinning | leases do not work |
+| `sqlite3` | run history, the predictor, device records | no prediction or stats |
+| `jq` | resolving `name=` destinations and device ownership | name-based destinations run unleased and unowned |
+
+`ai-aligned-xcode doctor` reports all three.
 
 ## License
 
