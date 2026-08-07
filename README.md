@@ -166,9 +166,21 @@ active devices held 39.8 GB while 28 never-booted ones cost 0.5 GB between them.
 Disk follows use, not existence.
 
 ```bash
-ai-aligned-xcode reap --older-than 3d          # dry run, with sizes and UDIDs
+ai-aligned-xcode reap --orphaned               # owning worktree is gone
+ai-aligned-xcode reap --older-than 3d          # or: idle that long
 ai-aligned-xcode reap --older-than 3d --apply  # delete them
 ```
+
+**`--orphaned` is usually the one you want.** With agents this busy nothing
+stays idle for long — on one machine after two days, 51.7 GB sat in the
+"used 1–3 days ago" bucket and *nothing at all* was older than seven. Age
+filters scrape a thin tail. Worktrees, meanwhile, come and go constantly, and
+a device abandoned an hour ago by a deleted worktree is already dead weight.
+
+The owning worktree's path is recorded when the device is claimed, because a
+label alone cannot be resolved back to a directory — `icon-race` could be a
+`.yolo` worktree, an intent workspace, or long gone. Devices claimed before
+that was recorded fall back to searching the usual worktree locations.
 
 Three things are never proposed, whatever the age:
 

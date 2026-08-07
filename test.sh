@@ -433,6 +433,26 @@ out="$(ai-aligned-xcode reap --older-than 3d 2>&1 | head -1)"
 case "$out" in *"not used in the last 3d"*) ok "reap --older-than selects by age" ;;
                *) no "reap --older-than selects by age" "$out" ;; esac
 
+# --orphaned must never propose an UNTAGGED device. TAB is IFS whitespace, so
+# bash read collapses runs of tabs; an empty owner column shifted every later
+# field left and made all 31 stock devices look orphaned. Dry run caught it.
+if has_xcode && command -v jq >/dev/null 2>&1; then
+    ai-aligned-xcode reap --orphaned >"$TMP/orph.out" 2>&1
+    bad=0
+    while read -r line; do
+        case "$line" in
+            *GB*owner\ gone*)
+                # Every proposed device must carry a [tag] in its name.
+                case "$line" in *"["*"]"*) ;; *) bad=$((bad+1)) ;; esac ;;
+        esac
+    done < "$TMP/orph.out"
+    [ "$bad" -eq 0 ] && ok "reap --orphaned only proposes tagged devices" \
+                     || no "reap --orphaned only proposes tagged devices" \
+                           "$bad untagged device(s) proposed — TSV field shift?"
+else
+    skip "orphan selection" "no Xcode or no jq"
+fi
+
 # Dry run must never delete.
 if has_xcode && command -v jq >/dev/null 2>&1; then
     n_before=$(/usr/bin/xcrun simctl list devices --json 2>/dev/null | jq -r '[.devices[][]]|length')

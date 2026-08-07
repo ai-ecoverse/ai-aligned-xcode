@@ -785,6 +785,11 @@ CREATE TABLE IF NOT EXISTS devices (
   claimed_at     INTEGER
 );
 SQL
+    # The owning worktree's absolute path. A label alone cannot be resolved
+    # back to a directory — "icon-race" could live under .yolo, under
+    # intent/workspaces, or nowhere — so record it when we claim.
+    /usr/bin/sqlite3 "$AAX_DB" >/dev/null 2>&1 \
+        "ALTER TABLE devices ADD COLUMN worktree_path TEXT;"
 }
 
 # ---------------------------------------------------------------- failure classes
@@ -1014,8 +1019,11 @@ aax_device_info() {
 aax_claim_device() {
     local udid="$1" base="$2" label="$3" created="${4:-0}"
     AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl rename "$udid" "$base [$label]" 2>/dev/null || return 1
-    aax_sql "INSERT OR REPLACE INTO devices(udid,base_name,owner,created_by_aax,claimed_at)
-             VALUES('${udid//\'/\'\'}','${base//\'/\'\'}','${label//\'/\'\'}',$created,$(date +%s));"
+    local wt; wt=$(aax_repo_root)
+    aax_sql "INSERT OR REPLACE INTO devices
+               (udid,base_name,owner,created_by_aax,claimed_at,worktree_path)
+             VALUES('${udid//\'/\'\'}','${base//\'/\'\'}','${label//\'/\'\'}',$created,
+                    $(date +%s),'${wt//\'/\'\'}');"
     return 0
 }
 
@@ -1065,8 +1073,11 @@ aax_device_for() {
     udid=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl create "$base [$label]" \
              "$dtype" "$runtime" 2>/dev/null | tr -d '[:space:]')
     [ -z "$udid" ] && return 1
-    aax_sql "INSERT OR REPLACE INTO devices(udid,base_name,owner,created_by_aax,claimed_at)
-             VALUES('${udid//\'/\'\'}','${base//\'/\'\'}','${label//\'/\'\'}',1,$(date +%s));"
+    local wt; wt=$(aax_repo_root)
+    aax_sql "INSERT OR REPLACE INTO devices
+               (udid,base_name,owner,created_by_aax,claimed_at,worktree_path)
+             VALUES('${udid//\'/\'\'}','${base//\'/\'\'}','${label//\'/\'\'}',1,
+                    $(date +%s),'${wt//\'/\'\'}');"
     aax_notice "simulator pool exhausted for this device type; created $base [$label] = $udid"
     printf '%s' "$udid"
 }
@@ -1158,6 +1169,36 @@ aax_duration_seconds() {
         s|'') echo "$n" ;;
         *) return 1 ;;
     esac
+}
+
+# Does the worktree that owns <label> still exist?
+#
+# The recorded path is authoritative. For devices claimed before that column
+# existed — or tagged by hand — fall back to searching the places worktrees
+# actually live. A label on its own is not resolvable: "icon-race" could be a
+# .yolo worktree, an intent workspace, or long gone.
+#
+# Echoes the path when found; returns 1 when the worktree is gone.
+aax_worktree_exists() {
+    local label="$1" recorded="$2" c
+    if [ -n "$recorded" ]; then
+        [ -d "$recorded" ] && { printf '%s' "$recorded"; return 0; }
+        return 1
+    fi
+    for c in "$HOME/intent/workspaces/$label" \
+             "$HOME/Developer/ai-ecoverse/$label" \
+             "$HOME/Developer/$label" \
+             "/tmp/$label" "/private/tmp/$label"; do
+        [ -d "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    # Worktrees nested under a repo: <repo>/.yolo/<label>, .claude-worktrees/<label>
+    for c in "$HOME"/Developer/*/.yolo/"$label" \
+             "$HOME"/Developer/*/*/.yolo/"$label" \
+             "$HOME"/Developer/*/.claude-worktrees/"$label" \
+             "$HOME"/Developer/*/*/.claude-worktrees/"$label"; do
+        [ -d "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
 }
 
 # True when <lockfile> exists and someone holds it.
@@ -1709,7 +1750,7 @@ EOF
         reap)
             aax_db_init
             shift
-            local apply=0 older="" include_never=0 arg
+            local apply=0 older="" include_never=0 orphaned=0 arg
             while [ $# -gt 0 ]; do
                 arg="$1"
                 case "$arg" in
@@ -1717,6 +1758,7 @@ EOF
                     --older-than)         older="$2"; shift ;;
                     --older-than=*)       older="${arg#*=}" ;;
                     --include-never-used) include_never=1 ;;
+                    --orphaned)           orphaned=1 ;;
                     *) echo "reap: unknown option '$arg'" >&2; return 1 ;;
                 esac
                 shift
@@ -1728,13 +1770,22 @@ EOF
                     || { echo "reap: cannot parse duration '$older' (try 3d, 12h, 90m)" >&2; return 1; }
             fi
 
-            # Candidate selection lives in python: it needs the device JSON,
-            # lastUsedAt arithmetic and byte sizes in one pass.
+            # One JSON fetch, shared by selection and reporting. mktemp rather
+            # than a fixed path: concurrent agents run this too.
+            local devjson; devjson=$(mktemp -t aax-devs) || return 1
+            AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json \
+                >"$devjson" 2>/dev/null
+
+            # Selection lives in python — it needs lastUsedAt arithmetic and
+            # byte sizes in one pass. Emits every non-booted available device
+            # as: udid, name, size, age, owner-tag, matches-age-criteria.
+            # Orphan filtering happens in bash below, because deciding whether
+            # a worktree still exists needs the filesystem and the database.
             local cands
-            cands=$(AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl list devices --json 2>/dev/null \
-              | AAX_CUTOFF="$cutoff" AAX_NEVER="$include_never" AAX_MINE="$(aax_sql \
-                    "SELECT group_concat(udid,' ') FROM devices WHERE created_by_aax=1;")" python3 -c '
-import json, os, sys, time
+            cands=$(AAX_CUTOFF="$cutoff" AAX_NEVER="$include_never" AAX_MINE="$(aax_sql \
+                    "SELECT group_concat(udid,' ') FROM devices WHERE created_by_aax=1;")" \
+                python3 -c '
+import json, os, re, sys, time
 from datetime import datetime, timezone
 
 cutoff = int(os.environ["AAX_CUTOFF"])
@@ -1742,14 +1793,14 @@ want_never = os.environ["AAX_NEVER"] == "1"
 mine = set((os.environ.get("AAX_MINE") or "").split())
 now = time.time()
 
-for rt, devs in json.load(sys.stdin)["devices"].items():
+for rt, devs in json.load(open(sys.argv[1]))["devices"].items():
     for d in devs:
         if not d.get("isAvailable"):
             continue
         # A booted device is in use by definition. Never a candidate.
         if d.get("state") == "Booted":
             continue
-        last, age = d.get("lastUsedAt"), None
+        last, age, matches = d.get("lastUsedAt"), None, False
         if last:
             t = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(
                 tzinfo=timezone.utc).timestamp()
@@ -1757,28 +1808,50 @@ for rt, devs in json.load(sys.stdin)["devices"].items():
         if cutoff:
             if last is None:
                 # Never-used devices are pristine stock at ~20MB. They are the
-                # supply that assignment draws from, not waste; deleting them
-                # forces a create for every new worktree. Opt in explicitly.
-                if not want_never:
-                    continue
-            elif (now - t) < cutoff:
-                continue
-        elif d["udid"] not in mine:
-            # No age filter: fall back to "devices this tool created".
-            continue
+                # supply assignment draws from, not waste; deleting them frees
+                # nothing and forces a create for the next worktree.
+                matches = want_never
+            else:
+                matches = (now - t) >= cutoff
+        else:
+            matches = d["udid"] in mine
+        m = re.search(r" \[([^]]+)\]$", d["name"])
+        # "-" rather than "": TAB is IFS whitespace, so bash read collapses
+        # runs of tabs and an empty field would silently shift every later
+        # column left — which made untagged devices look orphaned.
         print("\t".join([d["udid"], d["name"], str(d.get("dataPathSize") or 0),
-                         ("%.1f" % age) if age is not None else "never"]))
-' 2>/dev/null)
+                         ("%.1f" % age) if age is not None else "never",
+                         m.group(1) if m else "-", "1" if matches else "0"]))
+' "$devjson" 2>/dev/null)
 
-            if [ -n "$older" ]; then
+            # --orphaned selects by owner rather than age. That is the point:
+            # with agents this busy almost nothing gets old enough for an age
+            # filter to catch, while a device abandoned an hour ago by a
+            # deleted worktree is already dead weight.
+            if [ "$orphaned" = "1" ]; then
+                echo "devices whose owning worktree no longer exists:"
+            elif [ -n "$older" ]; then
                 echo "devices not used in the last $older:"
             else
                 echo "devices this tool created:"
             fi
 
-            local n=0 freed=0 u nm sz age skipped=0
-            while IFS=$'\t' read -r u nm sz age; do
+            local n=0 freed=0 u nm sz age owner match skipped=0 why wtp
+            while IFS=$'\t' read -r u nm sz age owner match; do
                 [ -z "$u" ] && continue
+
+                if [ "$orphaned" = "1" ]; then
+                    # Untagged devices have no owner and cannot be orphaned.
+                    { [ -z "$owner" ] || [ "$owner" = "-" ]; } && continue
+                    wtp=$(aax_sql "SELECT COALESCE(worktree_path,'') FROM devices
+                                   WHERE udid='${u//\'/\'\'}';")
+                    aax_worktree_exists "$owner" "$wtp" >/dev/null && continue
+                    why="owner gone"
+                else
+                    [ "$match" = "1" ] || continue
+                    why="$([ "$age" = "never" ] && echo never || echo "${age}d ago")"
+                fi
+
                 # Two live-use guards the JSON cannot answer.
                 if aax_lease_held "$AAX_LEASES/$u.lock"; then
                     echo "  skip  $nm ($u) — lease currently held"
@@ -1788,9 +1861,8 @@ for rt, devs in json.load(sys.stdin)["devices"].items():
                     echo "  skip  $nm ($u) — a running build references it"
                     skipped=$((skipped + 1)); continue
                 fi
-                printf '  %-30s %6.2f GB  %-12s %s\n' "${nm:0:30}" \
-                    "$(echo "$sz" | awk '{print $1/1073741824}')" \
-                    "$([ "$age" = "never" ] && echo never || echo "${age}d ago")" "$u"
+                printf '  %-34s %6.2f GB  %-12s %s\n' "${nm:0:34}" \
+                    "$(echo "$sz" | awk '{print $1/1073741824}')" "$why" "$u"
                 n=$((n + 1)); freed=$((freed + sz))
                 if [ "$apply" = "1" ]; then
                     if AI_ALIGNED_XCODE_ACTIVE=1 /usr/bin/xcrun simctl delete "$u" >/dev/null 2>&1; then
@@ -1802,6 +1874,7 @@ for rt, devs in json.load(sys.stdin)["devices"].items():
                     fi
                 fi
             done <<< "$cands"
+            rm -f "$devjson"
 
             [ "$n" -eq 0 ] && echo "  (none)"
             [ "$skipped" -gt 0 ] && echo "  ($skipped skipped as in use)"
@@ -1848,6 +1921,7 @@ xcrun, swift and xcodegen earlier on PATH; there is nothing to teach the agent.
   ai-aligned-xcode leases    which simulators are currently leased
   ai-aligned-xcode release   untag borrowed stock devices, restoring names (--apply)
   ai-aligned-xcode reap      delete devices this tool created (--apply)
+    reap --orphaned            ...or devices whose worktree is gone
     reap --older-than 3d       ...or any device unused for that long
     reap --include-never-used  ...also never-booted stock devices (rarely wanted)
   ai-aligned-xcode doctor    environment check
