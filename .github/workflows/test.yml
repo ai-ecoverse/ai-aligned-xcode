@@ -17,7 +17,7 @@ jobs:
     # macOS runners ship Xcode, lockf(1) and sqlite3, which the shim needs.
     runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
 
     - name: Show toolchain
       run: |
